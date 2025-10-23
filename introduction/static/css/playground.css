@@ -855,7 +855,8 @@
 .button--nanuk:hover > span:nth-child(odd),
 .button--nanuk:hover > span:nth-child(even) {
 	-webkit-animation-timing-function: cubic-bezier(0.75, 0, 0.125, 1);
-	transition-animation-function: cubic-bezier(0.75, 0, 0.125, 1);
+	animation-timing-function: cubic-bezier(0.075, 0, 0.125, 1);
+	transition-timing-function: cubic-bezier(0.75, 0, 0.125, 1);
 }
 @-webkit-keyframes anim-nanuk-1 {
 	0%,

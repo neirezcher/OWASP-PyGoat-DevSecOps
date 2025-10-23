@@ -26,13 +26,11 @@ for (i = 0; i < coll2.length; i++) {
 }
 function SendToServer(){
 
-        comment=document.getElementById("comment").value;
+        const comment=document.getElementById("comment").value;
 
-
-        var xhr;
-        xhr = new XMLHttpRequest();
-        xml="<?xml version='1.0'?>"+"<comm>"+"<text>"+comment+"</text>"+"</comm>";
-        var url = $("#Url").attr("data-url");
+        const xhr = new XMLHttpRequest();
+        const xml="<?xml version='1.0'?>"+"<comm>"+"<text>"+comment+"</text>"+"</comm>";
+        const url = $("#Url").attr("data-url");
        xhr.open("POST", url, true);
        xhr.setRequestHeader("Content-Type", "text/xml");
        xhr.send(xml);

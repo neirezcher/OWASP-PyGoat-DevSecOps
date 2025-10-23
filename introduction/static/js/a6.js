@@ -1,4 +1,4 @@
-event5 = function(){
+const event5 = function(){
     var code = document.getElementById('a6_t1').value
     var myHeaders = new Headers();
     var formdata = new FormData();
@@ -21,7 +21,7 @@ event5 = function(){
     .catch(error => console.log('error', error));
 }
 
-event6 = function(){
+const event6 = function(){
     var code = document.getElementById('a6_t1').value
     var myHeaders = new Headers();
     var formdata = new FormData();

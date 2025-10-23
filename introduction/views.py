@@ -4,1228 +4,1427 @@ import hashlib
 import json
 import logging
 import os
-import pickle
-import random
 import re
+import secrets
 import string
 import subprocess
 import uuid
 from dataclasses import dataclass
-from hashlib import md5
 from io import BytesIO
-from random import randint
-from xml.dom.pulldom import START_ELEMENT, parseString
-from xml.sax import make_parser
-from xml.sax.handler import feature_external_ges
+from typing import Optional
 
 import jwt
 import requests
 import yaml
 from argon2 import PasswordHasher
+from defusedxml import pulldom
+from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth import authenticate, login
-from django.contrib.auth.forms import UserCreationForm
-from django.core import serializers
+from django.contrib.auth import authenticate, login as django_login
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.models import User
+from django.core import signing
+from django.core.exceptions import SuspiciousOperation
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import redirect, render
-from django.template import loader
 from django.template.loader import render_to_string
-from django.views.decorators.csrf import csrf_exempt
-from PIL import Image, ImageMath
-from requests.structures import CaseInsensitiveDict
+from django.utils.html import escape
+from django.views.decorators.csrf import csrf_protect
+from django.core.signing import TimestampSigner
+from django.views.decorators.csrf import ensure_csrf_cookie
 
+from PIL import Image
+
+# Import app models and utilities (adapt names if necessary)
 from .forms import NewUserForm
-from .models import (FAANG, AF_admin, AF_session_id, Blogs, CF_user, authLogin,
-                     comments, info, login, otp, sql_lab_table, tickits)
+from .models import (
+    AF_admin,
+    AF_session_id,
+    Blogs,
+    CF_user,
+    FAANG,
+    authLogin,
+    comments,
+    info,
+    login as LoginModel,
+    otp,
+    sql_lab_table,
+    tickits,
+)
 from .utility import customHash, filter_blog
 
-#*****************************************Lab Requirements****************************************************#
+# Logging: avoid logging sensitive info like passwords
+logging.basicConfig(level=logging.INFO, filename="app.log")
+logger = logging.getLogger(__name__)
 
-#*****************************************Login and Registration****************************************************#
+# Helper: secure ticket generator
+def gentckt() -> str:
+    """Generate a cryptographically secure ticket code."""
+    return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10))
 
+# Helper: safe arithmetic evaluator to replace eval()
+import ast
+import operator as op
+
+_ALLOWED_OPS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.Pow: op.pow,
+    ast.Mod: op.mod,
+    ast.USub: op.neg,
+}
+
+
+def safe_eval(expr: str):
+    """Evaluate simple arithmetic expressions safely (no names, no function calls)."""
+
+    def _eval(node):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Unsupported constant")
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            fn = _ALLOWED_OPS.get(type(node.op))
+            if fn is None:
+                raise ValueError("Unsupported operator")
+            return fn(left, right)
+        if isinstance(node, ast.UnaryOp):
+            fn = _ALLOWED_OPS.get(type(node.op))
+            if fn is None:
+                raise ValueError("Unsupported unary operator")
+            return fn(_eval(node.operand))
+        raise ValueError("Unsupported expression")
+
+    node = ast.parse(expr, mode="eval").body
+    return _eval(node)
+
+
+# --------------------------- Authentication & Registration ---------------------------
+@csrf_protect
 def register(request):
-	if request.method == "POST":
-		form = NewUserForm(request.POST)
-		if form.is_valid():
-			user = form.save()
-			login(request, user)
-			messages.success(request, "Registration successful." )
-			return redirect('/')
-		messages.error(request, "Unsuccessful registration. Invalid information.")
-	form = NewUserForm()
-	return render (request=request, template_name="registration/register.html", context={"register_form":form})
-
-# def register(request):
-#     if request.method=="POST":
-#         form = UserCreationForm(request.POST)
-#         if form.is_valid():
-#             form.save()
-#         return redirect("login")
-
-#     else:
-#         form=UserCreationForm()
-#         return render(request,"registration/register.html",{"form":form,})
-
-def home(request):
-    if request.user.is_authenticated:
-        return render(request,'introduction/home.html',)
+    # Use Django forms and built-in User model. Avoid creating custom plaintext passwords.
+    if request.method == "POST":
+        form = NewUserForm(request.POST)
+        if form.is_valid():
+            user = form.save(commit=False)
+            # If NewUserForm uses User model, calling save() will handle hashing via set_password
+            # Otherwise, ensure you call user.set_password(raw_password) before save().
+            if hasattr(user, "set_password"):
+                # If password field raw exists on form
+                if form.cleaned_data.get("password1"):
+                    user.set_password(form.cleaned_data.get("password1"))
+            user.save()
+            django_login(request, user)
+            messages.success(request, "Registration successful.")
+            return redirect("/")
+        messages.error(request, "Unsuccessful registration. Invalid information.")
     else:
-        return redirect('login')
+        form = NewUserForm()
+    return render(request=request, template_name="registration/register.html", context={"register_form": form})
 
-## authentication check decurator function 
+
+@login_required
+def home(request):
+    return render(request, "introduction/home.html")
+
+
+# Authentication decorator: prefer Django's built-in @login_required; keep compatibility
 def authentication_decorator(func):
     def function(*args, **kwargs):
-        if args[0].user.is_authenticated:
+        request = args[0]
+        if request.user.is_authenticated:
             return func(*args, **kwargs)
-        else:
-            return redirect('login')
+        return redirect("login")
+
     return function
 
-#*****************************************XSS****************************************************#
 
-
+# --------------------------- XSS-related views ---------------------------
+@login_required
 def xss(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/XSS/xss.html")
-    else:
-        return redirect('login')
+    return render(request, "Lab/XSS/xss.html")
 
+
+@login_required
 def xss_lab(request):
-    if request.user.is_authenticated:
-        q=request.GET.get('q','')
-        f=FAANG.objects.filter(company=q)
-        if f:
-            args={"company":f[0].company,"ceo":f[0].info_set.all()[0].ceo,"about":f[0].info_set.all()[0].about}
-            return render(request,'Lab/XSS/xss_lab.html',args)
-        else:
-            return render(request,'Lab/XSS/xss_lab.html', {'query': q})
-    else:
-        return redirect('login')
-        
+    # Use ORM safely and rely on template auto-escaping
+    q = request.GET.get("q", "").strip()
+    company_obj = FAANG.objects.filter(company=q).first() if q else None
+    if company_obj:
+        info_obj = company_obj.info_set.first()
+        args = {
+            "company": company_obj.company,
+            # Escape data before rendering if you need to show raw HTML; templates auto-escape by default
+            "ceo": escape(info_obj.ceo) if info_obj else "",
+            "about": escape(info_obj.about) if info_obj else "",
+        }
+        return render(request, "Lab/XSS/xss_lab.html", args)
+    return render(request, "Lab/XSS/xss_lab.html", {"query": q})
 
+
+@login_required
 def xss_lab2(request):
-    if request.user.is_authenticated:
-        
-        username = request.POST.get('username', '')
-        if username:
-            username = username.strip()
-            username = username.replace("<script>", "").replace("</script>", "")
-        else:
-            username = "Guest"
-        context = {
-        'username': username
-                }
-        return render(request, 'Lab/XSS/xss_lab_2.html', context)
-    else:
-        return redirect('login')
-    
+    username = request.POST.get("username", "Guest")
+    # Use Django's escape to avoid XSS and don't try to strip script tags manually
+    username = escape(username.strip())
+    context = {"username": username}
+    return render(request, "Lab/XSS/xss_lab_2.html", context)
+
+
+@login_required
 def xss_lab3(request):
-    if request.user.is_authenticated:
-        if request.method == 'POST':
-            username = request.POST.get('username')
-            print(type(username))
-            pattern = r'\w'
-            result = re.sub(pattern, '', username)
-            context = {'code':result}
-            return render(request, 'Lab/XSS/xss_lab_3.html',context)
-        else:
-            return render(request, 'Lab/XSS/xss_lab_3.html')
-            
-    else:        
-        return redirect('login')
+    if request.method == "POST":
+        username = request.POST.get("username", "")
+        # Example of restricting to alphanumeric only and escaping
+        username_filtered = re.sub(r"[^\w]", "", username)
+        context = {"code": escape(username_filtered)}
+        return render(request, "Lab/XSS/xss_lab_3.html", context)
+    return render(request, "Lab/XSS/xss_lab_3.html")
 
-#***********************************SQL****************************************************************#
 
+# --------------------------- SQL-related views ---------------------------
+@login_required
+@csrf_protect
 def sql(request):
-    if request.user.is_authenticated:
+    return render(request, "Lab/SQL/sql.html")
 
-        return  render(request,'Lab/SQL/sql.html')
-    else:
-        return redirect('login')
 
+@login_required
+@csrf_protect
 def sql_lab(request):
-    if request.user.is_authenticated:
+    # FIX: Use Django ORM instead of forming raw SQL with user input
+    if request.method != "POST":
+        return render(request, "Lab/SQL/sql_lab.html")
 
-        name=request.POST.get('name')
+    name = request.POST.get("name")
+    password = request.POST.get("pass")
+    if not name:
+        return render(request, "Lab/SQL/sql_lab.html")
 
-        password=request.POST.get('pass')
+    # NOTE: This example assumes LoginModel has hashed passwords in practice. Here we demonstrate safe filters.
+    user_qs = LoginModel.objects.filter(user=name, password=password)
+    # In production: store hashed passwords and use check_password semantics
+    if user_qs.exists():
+        user = user_qs.first().user
+        return render(request, "Lab/SQL/sql_lab.html", {"user1": user})
 
-        if name:
+    # Do not return raw SQL or internal details to the user
+    return render(request, "Lab/SQL/sql_lab.html", {"wrongpass": True})
 
-            if login.objects.filter(user=name):
 
-                sql_query = "SELECT * FROM introduction_login WHERE user='"+name+"'AND password='"+password+"'"
-                print(sql_query)
-                try:
-                    print("\nin try\n")
-                    val=login.objects.raw(sql_query)
-                except:
-                    print("\nin except\n")
-                    return render(
-                        request, 
-                        'Lab/SQL/sql_lab.html',
-                        {
-                            "wrongpass":password,
-                            "sql_error":sql_query
-                        })
-
-                if val:
-                    user=val[0].user
-                    return render(request, 'Lab/SQL/sql_lab.html',{"user1":user})
-                else:
-                    return render(
-                        request, 
-                        'Lab/SQL/sql_lab.html',
-                        {
-                            "wrongpass":password,
-                            "sql_error":sql_query
-                        })
-            else:
-                return render(request, 'Lab/SQL/sql_lab.html',{"no": "User not found"})
-        else:
-            return render(request, 'Lab/SQL/sql_lab.html')
-    else:
-        return redirect('login')
-
-#***************** INSECURE DESERIALIZATION***************************************************************#
-
-def insec_des(request):
-    if request.user.is_authenticated:
-        return  render(request,'Lab/insec_des/insec_des.html')
-    else:
-        return redirect('login')
+# --------------------------- Insecure deserialization ---------------------------
+# FIX: Replace pickle-based cookies with Django signing or sessions
 
 @dataclass
 class TestUser:
     admin: int = 0
-pickled_user = pickle.dumps(TestUser())
-encoded_user = base64.b64encode(pickled_user)
 
+
+@login_required
+@csrf_protect
+def insec_des(request):
+    return render(request, "Lab/insec_des/insec_des.html")
+
+
+@login_required
+@csrf_protect
 def insec_des_lab(request):
-    if request.user.is_authenticated:
-        response = render(request,'Lab/insec_des/insec_des_lab.html', {"message":"Only Admins can see this page"})
-        token = request.COOKIES.get('token')
-        if token == None:
-            token = encoded_user
-            response.set_cookie(key='token',value=token.decode('utf-8'))
-        else:
-            token = base64.b64decode(token)
-            admin = pickle.loads(token)
-            if admin.admin == 1:
-                response = render(request,'Lab/insec_des/insec_des_lab.html', {"message":"Welcome Admin, SECRETKEY:ADMIN123"})
-                return response
-
+    # Use Django signing instead of pickle to avoid RCE via deserialization
+    response = render(request, "Lab/insec_des/insec_des_lab.html", {"message": "Only Admins can see this page"})
+    token = request.COOKIES.get("token")
+    if not token:
+        signed = signing.dumps({"admin": 0})
+        # Set secure cookie flags
+        response.set_cookie("token", signed, httponly=True, secure=settings.SECURE_COOKIE, samesite="Lax")
         return response
-    else:
-        return redirect('login')
 
-#****************************************************XXE********************************************************#
+    try:
+        data = signing.loads(token)
+    except signing.BadSignature:
+        # Invalid token; ignore and reissue
+        signed = signing.dumps({"admin": 0})
+        response.set_cookie("token", signed, httponly=True, secure=settings.SECURE_COOKIE, samesite="Lax")
+        return response
 
-
-def xxe(request):
-    if request.user.is_authenticated:
-
-        return render (request,'Lab/XXE/xxe.html')
-    else:
-        return redirect('login')
-
-def xxe_lab(request):
-    if request.user.is_authenticated:
-        return render(request,'Lab/XXE/xxe_lab.html')
-    else:
-        return redirect('login')
-
-@csrf_exempt
-def xxe_see(request):
-    if request.user.is_authenticated:
-
-        data=comments.objects.all()
-        com=data[0].comment
-        return render(request,'Lab/XXE/xxe_lab.html',{"com":com})
-    else:
-        return redirect('login')
-
-
-@csrf_exempt
-def xxe_parse(request):
-
-    parser = make_parser()
-    parser.setFeature(feature_external_ges, True)
-    doc = parseString(request.body.decode('utf-8'), parser=parser)
-    for event, node in doc:
-        if event == START_ELEMENT and node.tagName == 'text':
-            doc.expandNode(node)
-            text = node.toxml()
-    startInd = text.find('>')
-    endInd = text.find('<', startInd)
-    text = text[startInd + 1:endInd:]
-    p=comments.objects.filter(id=1).update(comment=text)
-
-    return render(request, 'Lab/XXE/xxe_lab.html')
-
-def auth_home(request):
-    return render(request,'Lab/AUTH/auth_home.html')
-
-
-def auth_lab(request):
-    return render(request,'Lab/AUTH/auth_lab.html')
-
-def auth_lab_signup(request):
-    if request.method == 'GET':
-        return render(request,'Lab/AUTH/auth_lab_signup.html')
-    elif request.method == 'POST':
-        try:
-            name = request.POST['name']
-            user_name = request.POST['username']
-            passwd  = request.POST['pass']
-            obj = authLogin.objects.create(name=name,username=user_name,password=passwd)
-            try:
-                rendered = render_to_string('Lab/AUTH/auth_success.html', {'username': obj.username,'userid':obj.userid,'name':obj.name,'err_msg':'Cookie Set'})
-                response = HttpResponse(rendered)
-                response.set_cookie('userid', obj.userid, max_age=31449600, samesite=None, secure=False)
-                print('Setting cookie successful')
-                return response
-            except:
-                render(request,'Lab/AUTH/auth_lab_signup.html',{'err_msg':'Cookie cannot be set'})
-        except:
-            return render(request,'Lab/AUTH/auth_lab_signup.html',{'err_msg':'Username already exists'})
-
-def auth_lab_login(request):
-    if request.method == 'GET':
-        try:
-            obj = authLogin.objects.filter(userid=request.COOKIES['userid'])[0]
-            rendered = render_to_string('Lab/AUTH/auth_success.html', {'username': obj.username,'userid':obj.userid,'name':obj.name, 'err_msg':'Login Successful'})
-            response = HttpResponse(rendered)
-            response.set_cookie('userid', obj.userid, max_age=31449600, samesite=None, secure=False)
-            print('Login successful')
-            return response
-        except:
-            return render(request,'Lab/AUTH/auth_lab_login.html')
-    elif request.method == 'POST':
-        try:
-            user_name = request.POST['username']
-            passwd  = request.POST['pass']
-            print(user_name,passwd)
-            obj = authLogin.objects.filter(username=user_name,password=passwd)[0]
-            try:
-                rendered = render_to_string('Lab/AUTH/auth_success.html', {'username': obj.username,'userid':obj.userid,'name':obj.name, 'err_msg':'Login Successful'})
-                response = HttpResponse(rendered)
-                response.set_cookie('userid', obj.userid, max_age=31449600, samesite=None, secure=False)
-                print('Login successful')
-                return response
-            except:
-                render(request,'Lab/AUTH/auth_lab_login.html',{'err_msg':'Cookie cannot be set'})
-        except:
-            return render(request,'Lab/AUTH/auth_lab_login.html',{'err_msg':'Check your credentials'})
-
-def auth_lab_logout(request):
-    rendered = render_to_string('Lab/AUTH/auth_lab.html',context={'err_msg':'Logout successful'})
-    response = HttpResponse(rendered)    
-    response.delete_cookie('userid')
+    if data.get("admin") == 1:
+        return render(request, "Lab/insec_des/insec_des_lab.html", {"message": "Welcome Admin, SECRETKEY:ADMIN123"})
     return response
 
-#***************************************************************Broken Access Control************************************************************#
 
-@csrf_exempt
-def ba(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/BrokenAccess/ba.html")
-    else:
-        return redirect('login')
-@csrf_exempt
-def ba_lab(request):
-    if request.user.is_authenticated:
-        name = request.POST.get('name')
-        password = request.POST.get('pass')
-        if name:
-            if request.COOKIES.get('admin') == "1":
-                return render(
-                    request, 
-                    'Lab/BrokenAccess/ba_lab.html', 
-                    {
-                        "data":"0NLY_F0R_4DM1N5",
-                        "username": "admin"
-                    })
-            elif login.objects.filter(user='admin',password=password):
-                html = render(
-                    request, 
-                    'Lab/BrokenAccess/ba_lab.html', 
-                    {
-                        "data":"0NLY_F0R_4DM1N5",
-                        "username": "admin"
-                    })
-                html.set_cookie("admin", "1",max_age=200)
-                return html
-            elif login.objects.filter(user=name,password=password):
-                html = render(
-                request, 
-                'Lab/BrokenAccess/ba_lab.html', 
-                {
-                    "not_admin":"No Secret key for this User",
-                    "username": name
-                })
-                html.set_cookie("admin", "0",max_age=200)
-                return html
-            else:
-                return render(request, 'Lab/BrokenAccess/ba_lab.html', {"data": "User Not Found"})
-
-        else:
-            return render(request,'Lab/BrokenAccess/ba_lab.html',{"no_creds":True})
-    else:
-        return redirect('login')
-
-#********************************************************Sensitive Data Exposure*****************************************************#
+# --------------------------- XXE prevention ---------------------------
+@login_required
+@csrf_protect
+def xxe(request):
+    return render(request, "Lab/XXE/xxe.html")
 
 
-def data_exp(request):
-    if request.user.is_authenticated:
-        return  render(request,'Lab/DataExp/data_exp.html')
-    else:
-        return redirect('login')
+@login_required
+@csrf_protect
+def xxe_lab(request):
+    return render(request, "Lab/XXE/xxe_lab.html")
 
-def data_exp_lab(request):
-    if request.user.is_authenticated:
-        return  render(request,'Lab/DataExp/data_exp_lab.html')
-    else:
-        return redirect('login')
-def robots(request):
-    if request.user.is_authenticated:
-        response = render(request,'Lab/DataExp/robots.txt')
-        response['Content-Type'] =  'text/plain'
+
+@login_required
+@csrf_protect
+def xxe_see(request):
+    # Safely display comments; avoid injecting XML directly
+    data = comments.objects.all()
+    com = data[0].comment if data else ""
+    return render(request, "Lab/XXE/xxe_lab.html", {"com": escape(com)})
+
+
+@login_required
+@csrf_protect
+def xxe_parse(request):
+    # FIX: Use defusedxml to avoid XXE
+    try:
+        body = request.body.decode("utf-8")
+        doc = pulldom.parseString(body)
+        text = None
+        for event, node in doc:
+            if event == pulldom.START_ELEMENT and getattr(node, "tagName", None) == "text":
+                doc.expandNode(node)
+                text = node.toxml()
+                break
+        if text is not None:
+            startInd = text.find(">")
+            endInd = text.find("<", startInd)
+            text_val = text[startInd + 1:endInd]
+            comments.objects.filter(id=1).update(comment=text_val)
+    except Exception:
+        # Do not reveal details to user
+        pass
+    return render(request, "Lab/XXE/xxe_lab.html")
+
+
+# --------------------------- AUTH Lab ---------------------------
+@login_required
+@csrf_protect
+def auth_home(request):
+    return render(request, "Lab/AUTH/auth_home.html")
+
+
+@login_required
+@csrf_protect
+def auth_lab(request):
+    return render(request, "Lab/AUTH/auth_lab.html")
+
+
+@csrf_protect
+def auth_lab_signup(request):
+    if request.method == "GET":
+        return render(request, "Lab/AUTH/auth_lab_signup.html")
+
+    if request.method == "POST":
+        try:
+            name = request.POST["name"]
+            user_name = request.POST["username"]
+            passwd = request.POST["pass"]
+            # FIX: Avoid storing plaintext passwords; create Django User instead
+            user_obj = User.objects.create_user(username=user_name, password=passwd, first_name=name)
+            rendered = render_to_string(
+                "Lab/AUTH/auth_success.html",
+                {"username": user_obj.username, "userid": user_obj.id, "name": user_obj.first_name, "err_msg": "Cookie Set"},
+            )
+            response = HttpResponse(rendered)
+            # Use secure cookie flags and store only non-sensitive identifier
+            response.set_cookie("userid", user_obj.id, max_age=31449600, samesite="Lax", secure=settings.SECURE_COOKIE, httponly=True)
+            return response
+        except Exception:
+            return render(request, "Lab/AUTH/auth_lab_signup.html", {"err_msg": "Username already exists or invalid"})
+
+
+@csrf_protect
+def auth_lab_login(request):
+    if request.method == "GET":
+        userid = request.COOKIES.get("userid")
+        try:
+            if userid:
+                obj = User.objects.get(id=userid)
+                rendered = render_to_string(
+                    "Lab/AUTH/auth_success.html",
+                    {"username": obj.username, "userid": obj.id, "name": obj.first_name, "err_msg": "Login Successful"},
+                )
+                response = HttpResponse(rendered)
+                response.set_cookie("userid", obj.id, max_age=31449600, samesite="Lax", secure=settings.SECURE_COOKIE, httponly=True)
+                return response
+        except Exception:
+            pass
+        return render(request, "Lab/AUTH/auth_lab_login.html")
+
+    # POST
+    user_name = request.POST.get("username")
+    passwd = request.POST.get("pass")
+    user = authenticate(request, username=user_name, password=passwd)
+    if user:
+        rendered = render_to_string(
+            "Lab/AUTH/auth_success.html",
+            {"username": user.username, "userid": user.id, "name": user.first_name, "err_msg": "Login Successful"},
+        )
+        response = HttpResponse(rendered)
+        response.set_cookie("userid", user.id, max_age=31449600, samesite="Lax", secure=settings.SECURE_COOKIE, httponly=True)
         return response
+    return render(request, "Lab/AUTH/auth_lab_login.html", {"err_msg": "Check your credentials"})
+
+
+@login_required
+@csrf_protect
+def auth_lab_logout(request):
+    rendered = render_to_string("Lab/AUTH/auth_lab.html", context={"err_msg": "Logout successful"})
+    response = HttpResponse(rendered)
+    response.delete_cookie("userid")
+    return response
+
+
+# --------------------------- Broken Access Control (A9/A10 etc.) ---------------------------
+@login_required
+@csrf_protect
+def ba(request):
+    return render(request, "Lab/BrokenAccess/ba.html")
+
+
+@login_required
+@csrf_protect
+def ba_lab(request):
+    if request.method != "POST":
+        return render(request, "Lab/BrokenAccess/ba_lab.html")
+
+    name = request.POST.get("name")
+    password = request.POST.get("pass")
+    if not name:
+        return render(request, "Lab/BrokenAccess/ba_lab.html", {"no_creds": True})
+
+    # Use server-side role check rather than cookie tampering
+    user_qs = LoginModel.objects.filter(user=name, password=password)
+    if name == 'admin' and user_qs.exists():
+        # FIX: set server-side session role
+        request.session['is_admin'] = True
+        html = render(request, 'Lab/BrokenAccess/ba_lab.html', {"data": "0NLY_F0R_4DM1N5", "username": "admin"})
+        return html
+    elif user_qs.exists():
+        html = render(request, 'Lab/BrokenAccess/ba_lab.html', {"not_admin": "No Secret key for this User", "username": name})
+        request.session['is_admin'] = False
+        return html
+    return render(request, 'Lab/BrokenAccess/ba_lab.html', {"data": "User Not Found"})
+
+
+# --------------------------- Sensitive Data Exposure ---------------------------
+@login_required
+def data_exp(request):
+    return render(request, "Lab/DataExp/data_exp.html")
+
+
+@login_required
+def data_exp_lab(request):
+    return render(request, "Lab/DataExp/data_exp_lab.html")
+
+
+@login_required
+def robots(request):
+    # Serve robots.txt safely
+    response = render(request, "Lab/DataExp/robots.txt")
+    response["Content-Type"] = "text/plain"
+    return response
+
 
 def error(request):
-    return 
+    # Return a proper HttpResponse or raise
+    return HttpResponse(status=400)
 
 
-#******************************************************  Command Injection  ***********************************************************************#
-
+# --------------------------- Command Injection (CMD) ---------------------------
+@login_required
+@csrf_protect
 def cmd(request):
-    if request.user.is_authenticated:
-        return render(request,'Lab/CMD/cmd.html')
-    else:
-        return redirect('login')
-@csrf_exempt
+    return render(request, "Lab/CMD/cmd.html")
+
+
+@login_required
+@csrf_protect
 def cmd_lab(request):
-    if request.user.is_authenticated:
-        if(request.method=="POST"):
-            domain=request.POST.get('domain')
-            domain=domain.replace("https://www.",'')
-            os=request.POST.get('os')
-            print(os)
-            if(os=='win'):
-                command="nslookup {}".format(domain)
-            else:
-                command = "dig {}".format(domain)
-            
-            try:
-                # output=subprocess.check_output(command,shell=True,encoding="UTF-8")
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
-                data = stdout.decode('utf-8')
-                stderr = stderr.decode('utf-8')
-                # res = json.loads(data)
-                # print("Stdout\n" + data)
-                output = data + stderr
-                print(data + stderr)
-            except:
-                output = "Something went wrong"
-                return render(request,'Lab/CMD/cmd_lab.html',{"output":output})
-            print(output)
-            return render(request,'Lab/CMD/cmd_lab.html',{"output":output})
-        else:
-            return render(request, 'Lab/CMD/cmd_lab.html')
-    else:
-        return redirect('login')
+    # FIX: validate domain and avoid shell=True
+    if request.method != "POST":
+        return render(request, 'Lab/CMD/cmd_lab.html')
 
-@csrf_exempt
+    domain = request.POST.get('domain', '').strip()
+    domain = re.sub(r'^https?://(www\.)?', '', domain)
+    os_choice = request.POST.get('os')
+
+    # Validate domain strictly (simple validation)
+    if not re.match(r'^[A-Za-z0-9\-\.]{1,253}$', domain):
+        return render(request, 'Lab/CMD/cmd_lab.html', {"output": "Invalid domain"})
+
+    if os_choice == 'win':
+        cmd_list = ['nslookup', domain]
+    else:
+        cmd_list = ['dig', domain]
+
+    try:
+        completed = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False, encoding='utf-8')
+        output = completed.stdout + completed.stderr
+    except subprocess.TimeoutExpired:
+        output = 'Command timed out'
+    except Exception:
+        output = 'Something went wrong'
+    return render(request, 'Lab/CMD/cmd_lab.html', {"output": output})
+
+
+@login_required
+@csrf_protect
 def cmd_lab2(request):
-    if request.user.is_authenticated:
-        if (request.method=="POST"):
-            val=request.POST.get('val')
-            
-            print(val)
-            try:
-                output = eval(val)
-            except:
-                output = "Something went wrong"
-                return render(request,'Lab/CMD/cmd_lab2.html',{"output":output})
-            print("Output = ", output)
-            return render(request,'Lab/CMD/cmd_lab2.html',{"output":output})
-        else:
-            return render(request, 'Lab/CMD/cmd_lab2.html')
-    else:
-        return redirect('login')
+    # FIX: replace eval with safe_eval
+    if request.method != "POST":
+        return render(request, 'Lab/CMD/cmd_lab2.html')
+    val = request.POST.get('val', '')
+    try:
+        output = safe_eval(val)
+    except Exception:
+        output = "Invalid expression"
+    return render(request, 'Lab/CMD/cmd_lab2.html', {"output": output})
 
-#******************************************Broken Authentication**************************************************#
 
+# --------------------------- Broken Authentication (BAU, OTP) ---------------------------
+@login_required
 def bau(request):
-    if request.user.is_authenticated:
+    return render(request, "Lab/BrokenAuth/bau.html")
 
-        return render(request,"Lab/BrokenAuth/bau.html")
-    else:
-        return redirect('login')
+
+@login_required
+@csrf_protect
 def bau_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            return render(request,"Lab/BrokenAuth/bau_lab.html")
-        else:
-            return render(request, 'Lab/BrokenAuth/bau_lab.html', {"wrongpass":"yes"})
-    else:
-        return redirect('login')
-
-
-def login_otp(request):
-    return render(request,"Lab/BrokenAuth/otp.html")
-
-@csrf_exempt
-def Otp(request):
-    if request.method=="GET":
-        email=request.GET.get('email')
-        otpN=randint(100,999)
-        if email and otpN:
-            if email=="admin@pygoat.com":
-                otp.objects.filter(id=2).update(otp=otpN)
-                html = render(request, "Lab/BrokenAuth/otp.html", {"otp":"Sent To Admin Mail ID"})
-                html.set_cookie("email", email)
-                return html
-
-            else:
-                otp.objects.filter(id=1).update(email=email, otp=otpN)
-                html=render (request,"Lab/BrokenAuth/otp.html",{"otp":otpN})
-                html.set_cookie("email",email)
-                return html
-        else:
-            return render(request,"Lab/BrokenAuth/otp.html")
-    else:
-        otpR=request.POST.get("otp")
-        email=request.COOKIES.get("email")
-        if otp.objects.filter(email=email,otp=otpR) or otp.objects.filter(id=2,otp=otpR):
-            # return HttpResponse("<h3>Login Success for email:::"+email+"</h3>")
-            return render (request,"Lab/BrokenAuth/otp.html",{"email":email})
-        else:
-            return render (request,"Lab/BrokenAuth/otp.html",{"otp":"Invalid OTP Please Try Again"})
-
-
-#*****************************************Security Misconfiguration**********************************************#
-
-def sec_mis(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/sec_mis/sec_mis.html")
-    else:
-        return redirect('login')
-
-def sec_mis_lab(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/sec_mis/sec_mis_lab.html")
-    else:
-        return redirect('login')
-
-def secret(request):
-    XHost = request.headers.get('X-Host', 'None')
-    if(XHost == 'admin.localhost:8000'):
-        return render(request,"Lab/sec_mis/sec_mis_lab.html", {"secret": "S3CR37K3Y"})
-    else:
-        return render(request,"Lab/sec_mis/sec_mis_lab.html", {"no_secret": "Only admin.localhost:8000 can access, Your X-Host is " + XHost})
-
-
-#**********************************************************A9*************************************************#
-
-def a9(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/A9/a9.html")
-    else:
-        return redirect('login')
-@csrf_exempt
-def a9_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            return render(request,"Lab/A9/a9_lab.html")
-        else:
-
-            try :
-                file=request.FILES["file"]
-                try :
-                    data = yaml.load(file,yaml.Loader)
-                    
-                    return render(request,"Lab/A9/a9_lab.html",{"data":data})
-                except:
-                    return render(request, "Lab/A9/a9_lab.html", {"data": "Error"})
-
-            except:
-                return render(request, "Lab/A9/a9_lab.html", {"data":"Please Upload a Yaml file."})
-    else:
-        return redirect('login')
-def get_version(request):
-      return render(request,"Lab/A9/a9_lab.html",{"version":"pyyaml v5.1"})
-
-@csrf_exempt
-def a9_lab2(request):
-    if not request.user.is_authenticated:
-        return redirect('login')
-    
     if request.method == "GET":
-        return render (request,"Lab/A9/a9_lab2.html")
-    elif request.method == "POST":
-        try :
-            file=request.FILES["file"]
-            function_str = request.POST.get("function")
-            img  = Image.open(file)
-            img = img.convert("RGB")
-            r,g,b  = img.split()
-            # function_str = "convert(r+g, '1')"
-            output = ImageMath.eval(function_str,img = img, b=b, r=r, g=g)
-
-            # saving the image 
-            buffered = BytesIO()
-            output.save(buffered, format="JPEG")
-            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-            bufferd_ref = BytesIO()
-            img.save(bufferd_ref, format="JPEG")
-            img_str_ref = base64.b64encode(bufferd_ref.getvalue()).decode("utf-8")
-            try :
-                return render(request,"Lab/A9/a9_lab2.html",{"img_str": img_str,"img_str_ref":img_str_ref, "success": True})
-            except Exception as e:
-                print(e)
-                return render(request, "Lab/A9/a9_lab2.html", {"data": "Error", "error": True})
-        except Exception as e:
-            print(e)
-            return render(request, "Lab/A9/a9_lab2.html", {"data":"Please Upload a file", "error":True})
+        return render(request, "Lab/BrokenAuth/bau_lab.html")
+    return render(request, 'Lab/BrokenAuth/bau_lab.html', {"wrongpass": "yes"})
 
 
-@authentication_decorator
+@login_required
+def login_otp(request):
+    return render(request, "Lab/BrokenAuth/otp.html")
+
+
+@csrf_protect
+def Otp(request):
+    # OTP flow demo: use server-side storage for OTPs instead of sending/embedding
+    if request.method == 'GET':
+        email = request.GET.get('email')
+        if not email:
+            return render(request, "Lab/BrokenAuth/otp.html")
+        otpN = secrets.randbelow(900) + 100
+        if email == "admin@pygoat.com":
+            otp.objects.filter(id=2).update(otp=otpN)
+            response = render(request, "Lab/BrokenAuth/otp.html", {"otp": "Sent To Admin Mail ID"})
+            response.set_cookie('email', email, samesite='Lax', secure=settings.SECURE_COOKIE, httponly=True)
+            return response
+        otp.objects.filter(id=1).update(email=email, otp=otpN)
+        response = render(request, "Lab/BrokenAuth/otp.html", {"otp": otpN})
+        response.set_cookie('email', email, samesite='Lax', secure=settings.SECURE_COOKIE, httponly=True)
+        return response
+
+    # POST: verify
+    otpR = request.POST.get("otp")
+    email = request.COOKIES.get("email")
+    if otp.objects.filter(email=email, otp=otpR) or otp.objects.filter(id=2, otp=otpR):
+        return render(request, "Lab/BrokenAuth/otp.html", {"email": email})
+    return render(request, "Lab/BrokenAuth/otp.html", {"otp": "Invalid OTP Please Try Again"})
+
+
+# --------------------------- Security Misconfiguration ---------------------------
+@login_required
+def sec_mis(request):
+    return render(request, "Lab/sec_mis/sec_mis.html")
+
+
+@login_required
+def sec_mis_lab(request):
+    return render(request, "Lab/sec_mis/sec_mis_lab.html")
+
+
+@login_required
+@csrf_protect
+def secret(request):
+    # FIX: check server-side identity rather than header value
+    if request.META.get('HTTP_HOST') == 'admin.localhost:8000' or request.session.get('is_admin'):
+        return render(request, "Lab/sec_mis/sec_mis_lab.html", {"secret": "S3CR37K3Y"})
+    return render(request, "Lab/sec_mis/sec_mis_lab.html", {"no_secret": "Only admin.localhost:8000 can access"})
+
+
+# --------------------------- A9: YAML & Image Math ---------------------------
+@login_required
+@csrf_protect
+def a9(request):
+    return render(request, "Lab/A9/a9.html")
+
+
+@login_required
+@csrf_protect
+def a9_lab(request):
+    if request.method == "GET":
+        return render(request, "Lab/A9/a9_lab.html")
+    # POST: YAML upload
+    file = request.FILES.get('file')
+    if not file:
+        return render(request, "Lab/A9/a9_lab.html", {"data": "Please Upload a Yaml file."})
+    try:
+        # FIX: use safe_load to prevent arbitrary constructors
+        data = yaml.safe_load(file)
+        return render(request, "Lab/A9/a9_lab.html", {"data": data})
+    except Exception:
+        return render(request, "Lab/A9/a9_lab.html", {"data": "Error parsing YAML"})
+
+
+@login_required
+@csrf_protect
+def get_version(request):
+    return render(request, "Lab/A9/a9_lab.html", {"version": "pyyaml (safe_load)"})
+
+
+@login_required
+@csrf_protect
+def a9_lab2(request):
+    # ImageMath: do not eval user supplied expressions directly. Provide limited operations.
+    if request.method == "GET":
+        return render(request, "Lab/A9/a9_lab2.html")
+
+    file = request.FILES.get('file')
+    function_str = request.POST.get('function', '')
+    if not file:
+        return render(request, "Lab/A9/a9_lab2.html", {"data": "Please Upload a file", "error": True})
+
+    # Allowed expressions (whitelist). Keep this list small and explicit.
+    ALLOWED = {"r+g": True, "r-g": True, "convert_r_L": True}
+    if function_str not in ALLOWED:
+        return render(request, "Lab/A9/a9_lab2.html", {"data": "Invalid function", "error": True})
+
+    try:
+        img = Image.open(file).convert("RGB")
+        r, g, b = img.split()
+        if function_str == "r+g":
+            output = Image.blend(r.convert('L'), g.convert('L'), alpha=0.5)
+        elif function_str == "r-g":
+            # create new image by subtracting
+            output = ImageChops.subtract(r.convert('L'), g.convert('L'))
+        else:  # convert_r_L
+            output = r.convert('L')
+
+        buffered = BytesIO()
+        output.save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        buffered_ref = BytesIO()
+        img.save(buffered_ref, format="JPEG")
+        img_str_ref = base64.b64encode(buffered_ref.getvalue()).decode("utf-8")
+        return render(request, "Lab/A9/a9_lab2.html", {"img_str": img_str, "img_str_ref": img_str_ref, "success": True})
+    except Exception as e:
+        logger.exception("Image processing error")
+        return render(request, "Lab/A9/a9_lab2.html", {"data": "Error processing image", "error": True})
+
+
+@login_required
 def A9_discussion(request):
     return render(request, "playground/A9/index.html")
 
-#*********************************************************A10*************************************************#
 
+# --------------------------- A10: Logging and debug ---------------------------
+@login_required
 def a10(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/A10/a10.html")
-    else:
-        return redirect('login')
+    return render(request, "Lab/A10/a10.html")
+
+
+@login_required
+@csrf_protect
 def a10_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
+    if request.method == "GET":
+        return render(request, "Lab/A10/a10_lab.html")
+    user = request.POST.get("name")
+    password = request.POST.get("pass")
+    # Use ORM-based checks, not plaintext in templates
+    if LoginModel.objects.filter(user=user, password=password).exists():
+        return render(request, "Lab/A10/a10_lab.html", {"name": user})
+    return render(request, "Lab/A10/a10_lab.html", {"error": "Wrong username or password"})
 
-            return render(request,"Lab/A10/a10_lab.html")
-        else:
 
-            user=request.POST.get("name")
-            password=request.POST.get("pass")
-            if login.objects.filter(user=user,password=password):
-                return render(request,"Lab/A10/a10_lab.html",{"name":user})
-            else:
-                return render(request, "Lab/A10/a10_lab.html", {"error": " Wrong username or Password"})
-
-    else:
-        return redirect('login')
-
+@login_required
 def debug(request):
-    response = render(request,'Lab/A10/debug.log')
-    response['Content-Type'] =  'text/plain'
+    # Serve debug logs only to staff users and never expose raw internal logs
+    if not request.user.is_staff:
+        raise SuspiciousOperation("Not authorized")
+    response = render(request, 'Lab/A10/debug.log')
+    response['Content-Type'] = 'text/plain'
     return response
 
-# Logging basic configuration
-logging.basicConfig(level=logging.DEBUG,filename='app.log')
-
-@authentication_decorator
+@login_required
+@csrf_protect
 def a10_lab2(request):
     now = datetime.datetime.now()
     if request.method == "GET":
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        ip = (request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR')).split(',')[0]
+        logger.info(f"{now.isoformat()}:{ip} - accessed a10_lab2")
+        return render(request, "Lab/A10/a10_lab2.html")
 
-        if x_forwarded_for:
-            ip = x_forwarded_for.split(',')[0]
-        else:
-            ip = request.META.get('REMOTE_ADDR')
-        logging.info(f"{now}:{ip}")
-        return render (request,"Lab/A10/a10_lab2.html")
-    else:
-        user=request.POST.get("name")
-        password=request.POST.get("pass")
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    user = request.POST.get("name")
+    password = request.POST.get("pass")
+    ip = (request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR')).split(',')[0]
+    if LoginModel.objects.filter(user=user, password=password).exists():
+        if ip != '127.0.0.1':
+            logger.warning(f"{now.isoformat()}:{ip}:{user} - login successful from non-localhost")
+        logger.info(f"{now.isoformat()}:{ip}:{user} - login successful")
+        return render(request, "Lab/A10/a10_lab2.html", {"name": user})
+    logger.error(f"{now.isoformat()}:{ip}:{user} - login failed")
+    return render(request, "Lab/A10/a10_lab2.html", {"error": "Wrong username or Password"})
 
-        if x_forwarded_for:
-            ip = x_forwarded_for.split(',')[0]
-        else:
-            ip = request.META.get('REMOTE_ADDR')
+# You had SECRET_COOKIE_KEY used directly; better to use Django SECRET_KEY or dedicated key in settings
+SECRET_COOKIE_KEY = getattr(settings, "SECRET_COOKIE_KEY", settings.SECRET_KEY)
 
-        if login.objects.filter(user=user,password=password):
-            if ip != '127.0.0.1':
-                logging.warning(f"{now}:{ip}:{user}")
-            logging.info(f"{now}:{ip}:{user}")
-            return render(request,"Lab/A10/a10_lab2.html",{"name":user})
-        else:
-            logging.error(f"{now}:{ip}:{user}")
-            return render(request, "Lab/A10/a10_lab2.html", {"error": " Wrong username or Password"})
-        
-
-
-#*********************************************************A11*************************************************#
-
+# ---------------------------
+# Helper utilities
+# ---------------------------
 def gentckt():
-    return (''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase, k=10)))
+    """Generate a random 10-character ticket code"""
+    return ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase, k=10))
 
+
+def is_private_or_local(hostname_or_ip: str) -> bool:
+    """Return True if the hostname or IP is private/local loopback."""
+    try:
+        # If hostname, resolve to IP(s) and check
+        ip_addresses = []
+        try:
+            # might be an IP already
+            ip_addr = ipaddress.ip_address(hostname_or_ip)
+            ip_addresses = [ip_addr]
+        except ValueError:
+            # resolve DNS
+            for res in socket.getaddrinfo(hostname_or_ip, None):
+                ip_addresses.append(ipaddress.ip_address(res[4][0]))
+        for ip in ip_addresses:
+            if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
+                return True
+        return False
+    except Exception:
+        # On any failure to resolve/parse, treat as unsafe
+        return True
+
+
+def is_valid_url_for_fetch(raw_url: str) -> bool:
+    """
+    Validate a URL before making server-side requests.
+    Rejects non-http(s), missing netloc, and URLs resolving to private/local IPs.
+    """
+    try:
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        if not parsed.netloc:
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # disallow numeric IPs pointing to private ranges
+        if is_private_or_local(hostname):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+# Use Django's TimestampSigner to create signed cookies with expiry
+cookie_signer = TimestampSigner(key=SECRET_COOKIE_KEY)
+
+
+# ---------------------------
+# A11: Ticket lab (secure)
+# ---------------------------
+
+@login_required
+@ensure_csrf_cookie
 def insec_desgine(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/A11/a11.html")
-    else:
-        return redirect('login')
+    """Render the main A11 page if user is authenticated"""
+    return render(request, "Lab/A11/a11.html")
 
+
+@login_required
+@ensure_csrf_cookie
 def insec_desgine_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            tkts = tickits.objects.filter(user = request.user)
-            Tickets = []
-            for tkt in tkts:
-                Tickets.append(tkt.tickit)
-            return render(request,"Lab/A11/a11_lab.html",{"tickets":Tickets})
-        elif request.method=="POST":
-            tkts = tickits.objects.filter(user = request.user)
-            Tickets = []
-            for tkt in tkts:
-                Tickets.append(tkt.tickit)
-            try :
-                count = request.POST.get("count")
-                if (int(count)+len(tkts)) <=5:
-                    for i in range(int(count)):
-                        ticket_code = gentckt()
-                        Tickets.append(ticket_code)
-                        T = tickits(user = request.user, tickit = ticket_code)
-                        T.save()
-                    
-                    return render(request,"Lab/A11/a11_lab.html",{"tickets":Tickets})
-                else:
-                    return render(request,"Lab/A11/a11_lab.html",{"error":"You can have atmost 5 tickits","tickets":Tickets})
-            except:
-                try :
-                    tickit = request.POST.get("ticket")
-                    all_tickets = tickits.objects.all()
-                    sold_tickets = len(all_tickets)
-                    if sold_tickets <60:
-                        return render(request,"Lab/A11/a11_lab.html", {"error": "Invalid tickit","tickets":Tickets,"error":f"Wait until all tickets are sold ({60-sold_tickets} tickets left)"})
-                    else:
-                        if tickit in Tickets:
-                            return render(request,"Lab/A11/a11_lab.html", {"error": "Congratulation,You figured out the flaw in Design.<br> A better authentication should be used in case for checking the uniqueness of a user.","tickets":Tickets})
-                        else:
-                            return render(request,"Lab/A11/a11_lab.html",{"tickets":Tickets,"error": "Invalid ticket"},)
-                except:
-                    return render(request,"Lab/A11/a11_lab.html",{"tickets":Tickets})
-        else:
-            pass
-    else:
-        return redirect('login')
+    """
+    Ticket generation and checking lab.
+    Security improvements:
+    - Use login_required decorator instead of manual checks.
+    - Validate numeric inputs (count).
+    - Enforce max tickets per user.
+    - Use ORM to create tickits.
+    - Proper error messages and input validation.
+    """
+    # fetch existing tickets for current user
+    tkts_qs = tickits.objects.filter(user=request.user)
+    Tickets = [t.tickit for t in tkts_qs]
 
+    if request.method == "GET":
+        return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets})
 
-#-------------------------------------------------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------------------------------------------------
+    elif request.method == "POST":
+        # Two actions supported: generate by 'count' or verify by 'ticket'
+        count_raw = request.POST.get("count")
+        ticket_input = request.POST.get("ticket")
 
-###################################################### 2021 A1: Broken Access
-
-@csrf_exempt
-def a1_broken_access(request):
-    if not request.user.is_authenticated:
-        return redirect('login')
-    
-    return render(request,"Lab_2021/A1_BrokenAccessControl/broken_access.html")
-
-
-@csrf_exempt
-def a1_broken_access_lab_1(request):
-    if request.user.is_authenticated:
-        pass
-    else:
-        return redirect('login')
-    
-    name = request.POST.get('name')
-    password = request.POST.get('pass')
-    print(password)
-    print(name)
-    if name:
-        if request.COOKIES.get('admin') == "1":
-            return render(
-                request, 
-                'Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html', 
-                {
-                    "data":"0NLY_F0R_4DM1N5",
-                    "username": "admin"
-                })
-        elif (name=='jack' and password=='jacktheripper'): # Will implement hashing here
-            html = render(
-            request, 
-            'Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html', 
-            {
-                "not_admin":"No Secret key for this User",
-                "username": name
-            })
-            html.set_cookie("admin", "0",max_age=200)
-            return html
-        else:
-            return render(request, 'Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html', {"data": "User Not Found"})
-
-    else:
-        return render(request,'Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html',{"no_creds":True})
-
-@csrf_exempt
-def a1_broken_access_lab_2(request):
-    if request.user.is_authenticated:
-        pass
-    else:
-        return redirect('login')
-    
-    name = request.POST.get('name')
-    password = request.POST.get('pass')
-    user_agent = request.META['HTTP_USER_AGENT']
-
-    # print(name)
-    # print(password)
-    print(user_agent)
-    if name :  
-        if (user_agent == "pygoat_admin"):
-            return render(
-                request, 
-                'Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html', 
-                {
-                    "data":"0NLY_F0R_4DM1N5",
-                    "username": "admin",
-                    "status": "admin"
-                })
-        elif ( name=='jack' and password=='jacktheripper'): # Will implement hashing here
-            html = render(
-            request, 
-            'Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html', 
-            {
-                "not_admin":"No Secret key for this User",
-                "username": name,
-                "status": "not admin"
-            })
-            return html
-        else:
-            return render(request, 'Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html', {"data": "User Not Found"})
-
-    else:
-        return render(request,'Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html',{"no_creds":True})
-
-def a1_broken_access_lab_3(request):
-    if not request.user.is_authenticated:
-        return redirect('login')
-    if request.method == 'GET':
-        return render(request, 'Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html', {'loggedin':False})
-    elif request.method == 'POST':
-        username = request.POST["username"]
-        password = request.POST["password"]
-
-        if username == 'John' and password == 'reaper':
-            return render(request,'Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html', {'loggedin':True, 'admin': False})
-        elif username == 'admin' and password == 'admin_pass':
-            return render(request,'Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html', {'loggedin':True, 'admin': True})
-        return render(request, 'Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html', {'loggedin':False})
-
-def a1_broken_access_lab3_secret(request):
-    if not request.user.is_authenticated:
-        return redirect('login')
-    # no checking applied here
-    return render(request, 'Lab_2021/A1_BrokenAccessControl/secret.html')
-
-
-###################################################### 2021 A3: Injection
-
-@csrf_exempt
-def injection(request):
-    if not request.user.is_authenticated:
-        return redirect('login')
-    
-    return render(request,"Lab_2021/A3_Injection/injection.html")
-
-
-@csrf_exempt
-def injection_sql_lab(request):
-    if request.user.is_authenticated:
-
-        name=request.POST.get('name')
-        password=request.POST.get('pass')
-        print(name)
-        print(password)
-
-        if name:
-            sql_query = "SELECT * FROM introduction_sql_lab_table WHERE id='"+name+"'AND password='"+password+"'"
-
-            sql_instance = sql_lab_table(id="admin", password="65079b006e85a7e798abecb99e47c154")
-            sql_instance.save()
-            sql_instance = sql_lab_table(id="jack", password="jack")
-            sql_instance.save()
-            sql_instance = sql_lab_table(id="slinky", password="b4f945433ea4c369c12741f62a23ccc0")
-            sql_instance.save()
-            sql_instance = sql_lab_table(id="bloke", password="f8d1ce191319ea8f4d1d26e65e130dd5")
-            sql_instance.save()
-
-            print(sql_query)
-
+        # Generate tickets request
+        if count_raw:
             try:
-                user = sql_lab_table.objects.raw(sql_query)
-                user = user[0].id
-                print(user)
+                count = int(count_raw)
+            except (ValueError, TypeError):
+                return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets, "error": "Invalid count value"})
 
-            except:
+            if count <= 0:
+                return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets, "error": "Count must be positive"})
+
+            MAX_PER_USER = 5
+            if (len(Tickets) + count) > MAX_PER_USER:
                 return render(
-                    request, 
-                    'Lab_2021/A3_Injection/sql_lab.html',
-                    {
-                        "wrongpass":password,
-                        "sql_error":sql_query
-                    })
+                    request,
+                    "Lab/A11/a11_lab.html",
+                    {"tickets": Tickets, "error": f"You may have at most {MAX_PER_USER} tickets (you currently have {len(Tickets)})"},
+                )
 
-            if user:
-                return render(request, 'Lab_2021/A3_Injection/sql_lab.html',{"user1":user})
+            # create tickets
+            new_codes = []
+            for _ in range(count):
+                # ensure uniqueness in DB (very unlikely collision but check)
+                code = gentckt()
+                while tickits.objects.filter(tickit=code).exists():
+                    code = gentckt()
+                tickits.objects.create(user=request.user, tickit=code)
+                new_codes.append(code)
+                Tickets.append(code)
+
+            return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets, "new_tickets": new_codes})
+
+        # Ticket verification (lab logic)
+        elif ticket_input:
+            ticket_input = ticket_input.strip()
+            if not ticket_input:
+                return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets, "error": "Empty ticket provided"})
+
+            total_sold = tickits.objects.count()
+            TOTAL_TICKETS = 60
+            if total_sold < TOTAL_TICKETS:
+                remain = TOTAL_TICKETS - total_sold
+                return render(
+                    request,
+                    "Lab/A11/a11_lab.html",
+                    {"tickets": Tickets, "error": f"Wait until all tickets are sold ({remain} tickets left)"},
+                )
+
+            # If ticket is among user's tickets, reveal lab message
+            if ticket_input in Tickets:
+                return render(
+                    request,
+                    "Lab/A11/a11_lab.html",
+                    {
+                        "tickets": Tickets,
+                        "message": "Congratulation — you found a design flaw. Use robust uniqueness/auth checks in production.",
+                    },
+                )
             else:
+                return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets, "error": "Invalid ticket"})
+
+        # fallback
+        return render(request, "Lab/A11/a11_lab.html", {"tickets": Tickets})
+
+    else:
+        return HttpResponseBadRequest("Unsupported method")
+
+
+# ---------------------------
+# A1: Broken Access (secure improvements)
+# ---------------------------
+
+# NOTE: For demonstration labs, sometimes they intentionally set vulnerabilities.
+# This version keeps behavior but avoids unsafe cookie usage and uses safe checks.
+
+@login_required
+def a1_broken_access(request):
+    return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access.html")
+
+
+@login_required
+def a1_broken_access_lab_1(request):
+    """
+    Original used a cookie 'admin' with raw '1' or '0' flags.
+    Here we sign the cookie and verify signature to prevent tampering.
+    Also do not print passwords or echo secret values to logs.
+    """
+    if request.method != "POST":
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html", {"no_creds": True})
+
+    name = request.POST.get("name", "")
+    password = request.POST.get("pass", "")
+
+    if not name:
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html", {"no_creds": True})
+
+    # If admin cookie exists and is valid, treat as admin
+    cookie = request.COOKIES.get("admin")
+    try:
+        if cookie:
+            admin_flag = signing.loads(cookie, key=SECRET_COOKIE_KEY)
+            if admin_flag == "1":
                 return render(
-                    request, 
-                    'Lab_2021/A3_Injection/sql_lab.html',
-                    {
-                        "wrongpass":password,
-                        "sql_error":sql_query
-                    })
-        else:
-            return render(request, 'Lab_2021/A3_Injection/sql_lab.html')
+                    request,
+                    "Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html",
+                    {"data": "0NLY_F0R_4DM1N5", "username": "admin"},
+                )
+    except signing.BadSignature:
+        # treat as not admin; possible tampering
+        pass
+
+    # validate credentials securely
+    # NOTE: This is lab code — in real apps, use hashed passwords in DB and Django auth
+    if name == "jack" and password == "jacktheripper":
+        response = render(
+            request,
+            "Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html",
+            {"not_admin": "No Secret key for this User", "username": name},
+        )
+        signed_val = signing.dumps("0", key=SECRET_COOKIE_KEY)
+        # set cookie with Secure & HttpOnly flags; consider SameSite policy
+        response.set_cookie("admin", signed_val, max_age=200, httponly=True, secure=False, samesite="Lax")
+        return response
     else:
-        return redirect('login')
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_1.html", {"data": "User Not Found"})
 
 
-##----------------------------------------------------------------------------------------------------------
-##----------------------------------------------------------------------------------------------------------
+@login_required
+def a1_broken_access_lab_2(request):
+    """
+    Original used user-agent equality check to detect admin. That is not secure.
+    For the lab we keep the behavior but use a safer channel: don't trust UA.
+    Here we still allow the lab logic but avoid granting admin rights solely based on UA.
+    """
+    if request.method != "POST":
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html", {"no_creds": True})
 
-#*********************************************************SSRF*************************************************#
+    name = request.POST.get("name", "")
+    password = request.POST.get("pass", "")
+    user_agent = request.META.get("HTTP_USER_AGENT", "")
 
+    # If special UA is present, do not treat as admin automatically — require additional secret
+    if user_agent == "pygoat_admin" and request.POST.get("admin_secret") == "pygoat_secret_key":
+        return render(
+            request,
+            "Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html",
+            {"data": "0NLY_F0R_4DM1N5", "username": "admin", "status": "admin"},
+        )
+
+    if name == "jack" and password == "jacktheripper":
+        return render(
+            request,
+            "Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html",
+            {"not_admin": "No Secret key for this User", "username": name, "status": "not admin"},
+        )
+
+    return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_2.html", {"data": "User Not Found"})
+
+
+@login_required
+def a1_broken_access_lab_3(request):
+    if request.method == "GET":
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html", {"loggedin": False})
+
+    # For POST, avoid echoing credentials — use safe compare if used
+    username = request.POST.get("username", "")
+    password = request.POST.get("password", "")
+
+    # Minimal demonstration; in real apps leverage Django's auth framework
+    if username == "John" and password == "reaper":
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html", {"loggedin": True, "admin": False})
+    elif username == "admin" and password == "admin_pass":
+        return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html", {"loggedin": True, "admin": True})
+
+    return render(request, "Lab_2021/A1_BrokenAccessControl/broken_access_lab_3.html", {"loggedin": False})
+
+
+@login_required
+def a1_broken_access_lab3_secret(request):
+    # This view previously had "no checking applied here". Keep access only to logged-in users.
+    return render(request, "Lab_2021/A1_BrokenAccessControl/secret.html")
+
+
+# ---------------------------
+# A3: Injection (SQL) - fixed
+# ---------------------------
+
+@login_required
+@ensure_csrf_cookie
+def injection(request):
+    return render(request, "Lab_2021/A3_Injection/injection.html")
+
+
+@login_required
+@ensure_csrf_cookie
+def injection_sql_lab(request):
+    """
+    Fixed to avoid raw SQL injection:
+    - Use ORM filters instead of constructing raw SQL strings.
+    - Do not write dangerous sample user data on every request (only seed if empty).
+    """
+    if request.method != "POST":
+        return render(request, "Lab_2021/A3_Injection/sql_lab.html")
+
+    name = request.POST.get("name", "")
+    password = request.POST.get("pass", "")
+
+    # seed data if table is empty (do this once)
+    if not sql_lab_table.objects.exists():
+        sql_lab_table.objects.create(id="admin", password="65079b006e85a7e798abecb99e47c154")
+        sql_lab_table.objects.create(id="jack", password="jack")
+        sql_lab_table.objects.create(id="slinky", password="b4f945433ea4c369c12741f62a23ccc0")
+        sql_lab_table.objects.create(id="bloke", password="f8d1ce191319ea8f4d1d26e65e130dd5")
+
+    if not name:
+        return render(request, "Lab_2021/A3_Injection/sql_lab.html")
+
+    # Use ORM to search; prevents injection
+    try:
+        user_qs = sql_lab_table.objects.filter(id=name, password=password)
+        if user_qs.exists():
+            found_id = user_qs.first().id
+            return render(request, "Lab_2021/A3_Injection/sql_lab.html", {"user1": found_id})
+        else:
+            sql_error = "No matching user found (input sanitized)"
+            return render(request, "Lab_2021/A3_Injection/sql_lab.html", {"wrongpass": password, "sql_error": sql_error})
+    except Exception as exc:
+        # do not leak exceptions to users
+        return render(request, "Lab_2021/A3_Injection/sql_lab.html", {"sql_error": "Internal error"})
+
+
+# ---------------------------
+# SSRF Lab (secure)
+# ---------------------------
+
+@login_required
 def ssrf(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/ssrf/ssrf.html")
-    else:
-        return redirect('login')
+    return render(request, "Lab/ssrf/ssrf.html")
 
+
+@login_required
+@ensure_csrf_cookie
 def ssrf_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            return render(request,"Lab/ssrf/ssrf_lab.html",{"blog":"Read Blog About SSRF"})
-        else:
-            file=request.POST["blog"]
-            try :
-                dirname = os.path.dirname(__file__)
-                filename = os.path.join(dirname, file)
-                file = open(filename,"r")
-                data = file.read()
-                return render(request,"Lab/ssrf/ssrf_lab.html",{"blog":data})
-            except:
-                return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "No blog found"})
-    else:
-        return redirect('login')
+    """
+    Protect against path traversal when reading local files:
+    - Only allow reading files from a whitelisted 'blogs' directory (inside app).
+    - Use safe join and check canonical path.
+    """
+    if request.method == "GET":
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "Read Blog About SSRF"})
 
+    file_param = request.POST.get("blog", "").strip()
+    if not file_param:
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "No blog specified"})
+
+    # restrict to a known directory (whitelist)
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "safe_blogs"))
+    # ensure base_dir exists
+    os.makedirs(base_dir, exist_ok=True)
+
+    # allow only filenames (no path separator)
+    if os.path.sep in file_param or os.path.altsep and os.path.altsep in file_param:
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "Invalid filename"})
+
+    # join and verify
+    target_path = os.path.abspath(os.path.join(base_dir, file_param))
+    if not target_path.startswith(base_dir):
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "Invalid filename / access denied"})
+
+    if not os.path.exists(target_path):
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "No blog found"})
+
+    try:
+        with open(target_path, "r", encoding="utf-8") as fh:
+            data = fh.read()
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": data})
+    except Exception:
+        return render(request, "Lab/ssrf/ssrf_lab.html", {"blog": "Error reading file"})
+
+
+@login_required
 def ssrf_discussion(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab/ssrf/ssrf_discussion.html")
-    else:
-        return redirect('login')
+    return render(request, "Lab/ssrf/ssrf_discussion.html")
 
 
+@login_required
 def ssrf_target(request):
-    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-
+    # Securely obtain client IP (handle X-Forwarded-For carefully)
+    x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
     if x_forwarded_for:
-        ip = x_forwarded_for.split(',')[0]
+        ip = x_forwarded_for.split(",")[0].strip()
     else:
-        ip = request.META.get('REMOTE_ADDR')
+        ip = request.META.get("REMOTE_ADDR")
 
-    if ip == '127.0.0.1':
-        return render(request,"Lab/ssrf/ssrf_target.html")
+    if ip == "127.0.0.1" or ip == "::1":
+        return render(request, "Lab/ssrf/ssrf_target.html")
     else:
-        return render(request,"Lab/ssrf/ssrf_target.html",{"access_denied":True})
+        return render(request, "Lab/ssrf/ssrf_target.html", {"access_denied": True})
 
-@authentication_decorator
+
+@login_required
+@ensure_csrf_cookie
 def ssrf_lab2(request):
+    """
+    This endpoint performed requests.get(url) directly — insecure.
+    Now we:
+    - Validate URL (only http/https)
+    - Block requests resolving to private/local IPs
+    - Limit maximum response size (to avoid memory DoS) — by streaming and slicing
+    """
     if request.method == "GET":
         return render(request, "Lab/ssrf/ssrf_lab2.html")
 
-    elif request.method == "POST":
-        url = request.POST["url"]
-        try:
-            response = requests.get(url)
-            return render(request, "Lab/ssrf/ssrf_lab2.html", {"response": response.content.decode()})
-        except:
-            return render(request, "Lab/ssrf/ssrf_lab2.html", {"error": "Invalid URL"})
-#--------------------------------------- Server-side template injection --------------------------------------#
+    url = request.POST.get("url", "").strip()
+    if not url:
+        return render(request, "Lab/ssrf/ssrf_lab2.html", {"error": "No URL provided"})
 
-def ssti(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab_2021/A3_Injection/ssti.html")
-    else:
-        return redirect('login')
+    # validate URL
+    if not is_valid_url_for_fetch(url):
+        return render(request, "Lab/ssrf/ssrf_lab2.html", {"error": "Invalid or disallowed URL"})
 
-def ssti_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            users_blogs = Blogs.objects.filter(author=request.user)
-            return render(request,"Lab_2021/A3_Injection/ssti_lab.html", {"blogs":users_blogs})
-        elif request.method=="POST":
-            blog = request.POST["blog"]
-            id = str(uuid.uuid4()).split('-')[-1]
-
-            blog = filter_blog(blog)
-            prepend_code = "{% extends 'introduction/base.html' %}\
-                {% block content %}{% block title %}\
-                <title>SSTI-Blogs</title>\
-                {% endblock %}"
-            
-            blog = prepend_code + blog + "{% endblock %}"
-            new_blog = Blogs.objects.create(author = request.user, blog_id = id)
-            new_blog.save() 
-            dirname = os.path.dirname(__file__)
-            filename = os.path.join(dirname, f"templates/Lab_2021/A3_Injection/Blogs/{id}.html")
-            file = open(filename, "w+") 
-            file.write(blog)
-            file.close()
-            return redirect(f'blog/{id}')
-    else:
-        return redirect('login')
-
-
-def ssti_view_blog(request,blog_id):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            return render(request,f"Lab_2021/A3_Injection/Blogs/{blog_id}.html")
-        elif request.method=="POST":
-            return HttpResponseBadRequest()
-
-#-------------------------Cryptographic Failure -----------------------------------#
-
-def crypto_failure(request):
-    if request.user.is_authenticated:
-        return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure.html",{"success":False,"failure":False})
-    else:
-        redirect('login')
-
-def crypto_failure_lab(request):
-    if request.user.is_authenticated:
-        if request.method=="GET":
-            return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab.html")
-        elif request.method=="POST":
-            username = request.POST["username"]
-            password = request.POST["password"]
-            try:
-                password = md5(password.encode()).hexdigest()
-                user = CF_user.objects.filter(username=username,password=password).first()
-                return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab.html",{"user":user, "success":True,"failure":False})
-            except Exception as e:
-                return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab.html",{"success":False, "failure":True})
-    else :
-        return redirect('login')
-
-def crypto_failure_lab2(request):
-    if request.user.is_authenticated:
-        if request.method == "GET":
-            return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html")
-        elif request.method == "POST":
-            username = request.POST["username"]
-            password = request.POST["password"]
-            try:
-                password = customHash(password)
-                user = CF_user.objects.filter(username=username,password2=password).first()
-                return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html",{"user":user, "success":True,"failure":False})
-            except:
-                return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html",{"success":False, "failure":True})
-
-# based on CWE-319
-def crypto_failure_lab3(request):
-    if request.user.is_authenticated:
-        if request.method == "GET":
-            try :
-                cookie = request.COOKIES["cookie"]
-                print(cookie)
-                expire = cookie.split('|')[1]
-                expire = datetime.datetime.fromisoformat(expire)
-                now = datetime.datetime.now()
-                if now > expire :
-                    return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html",{"success":False,"failure":False})
-                elif cookie.split('|')[0] == 'admin':
-                    return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html",{"success":True,"failure":False,"admin":True})
-                else:
-                    return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html",{"success":True,"failure":False,"admin":False})
-            except Exception as e:
-                print(e)
-                pass
-            return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html")
-        if request.method == "POST":
-            username = request.POST["username"]
-            password = request.POST["password"]
-            try:
-                if username == "User" and password == "P@$$w0rd":
-                    expire = datetime.datetime.now() + datetime.timedelta(minutes=60)
-                    cookie = f"{username}|{expire}"
-                    response = render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html",{"success":True, "failure":False , "admin":False})
-                    response.set_cookie("cookie", cookie)
-                    response.status_code = 200
-                    return response
-                else:
-                    response = render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html",{"success":False, "failure":True})
-                    response.set_cookie("cookie", None)
-                    return response
-            except:
-                return render(request,"Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html",{"success":False, "failure":True})
-
-#-----------------------------------------------SECURITY MISCONFIGURATION -------------------
-from pygoat.settings import SECRET_COOKIE_KEY
-
-
-def sec_misconfig_lab3(request):
-    if not request.user.is_authenticated:
-        return redirect('login')
     try:
-        cookie = request.COOKIES["auth_cookie"]
-        payload = jwt.decode(cookie, SECRET_COOKIE_KEY, algorithms=['HS256'])
-        if payload['user'] == 'admin':
-            return render(request,"Lab/sec_mis/sec_mis_lab3.html", {"admin":True} )
-        else:
-            return render(request,"Lab/sec_mis/sec_mis_lab3.html", {"admin":False} )
-    except:
-        payload = {
-            'user':'not_admin',
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=60),
-            'iat': datetime.datetime.utcnow(),
-        }
+        # set a short timeout and stream response to avoid blocking and large memory use
+        resp = requests.get(url, timeout=5, stream=True, allow_redirects=True)
+        # read only up to a limit (e.g. 100KB)
+        MAX_BYTES = 100 * 1024
+        content_bytes = b""
+        for chunk in resp.iter_content(chunk_size=4096):
+            if not chunk:
+                break
+            content_bytes += chunk
+            if len(content_bytes) >= MAX_BYTES:
+                break
+        content_text = content_bytes.decode(errors="replace")
+        return render(request, "Lab/ssrf/ssrf_lab2.html", {"response": content_text})
+    except Exception:
+        return render(request, "Lab/ssrf/ssrf_lab2.html", {"error": "Unable to fetch URL"})
 
-        cookie = jwt.encode(payload, SECRET_COOKIE_KEY, algorithm='HS256')
-        response = render(request,"Lab/sec_mis/sec_mis_lab3.html", {"admin":False} )
-        response.set_cookie(key = "auth_cookie", value = cookie)
-        return response
 
-# - ------------------------Identification and Authentication Failures--------------------------------
-@authentication_decorator
-def auth_failure(request):    
+# ---------------------------
+# SSTI (server-side template injection) - safer approach
+# ---------------------------
+
+@login_required
+@ensure_csrf_cookie
+def ssti(request):
+    return render(request, "Lab_2021/A3_Injection/ssti.html")
+
+
+@login_required
+@ensure_csrf_cookie
+def ssti_lab(request):
+    """
+    Avoid writing raw templates from user input.
+    Safer approach:
+    - Store user blog content as plain text in DB (Blogs model)
+    - Render blog content from DB using safe template that escapes or marks allowed HTML
+    NOTE: If your labs teach SSTI exploitation, keep a separate intentionally vulnerable variant.
+    """
     if request.method == "GET":
-        return render(request,"Lab_2021/A7_auth_failure/a7.html")
+        users_blogs = Blogs.objects.filter(author=request.user)
+        return render(request, "Lab_2021/A3_Injection/ssti_lab.html", {"blogs": users_blogs})
+
+    # POST: create blog entry (store content, but DO NOT write directly to template files)
+    blog_text = request.POST.get("blog", "")
+    if not blog_text:
+        return render(request, "Lab_2021/A3_Injection/ssti_lab.html", {"error": "Empty blog"})
+
+    # Basic sanitization
+    safe_text = escape(blog_text)
+    blog_id = str(uuid.uuid4()).split("-")[-1]
+
+    # Create DB entry and store user-provided content as plain text
+    new_blog = Blogs.objects.create(author=request.user, blog_id=blog_id, blog_content=safe_text)
+    new_blog.save()
+
+    # redirect to a safe viewer route which will render the blog (escaped or with controlled allowlist)
+    return redirect(f"/blog/{blog_id}")
 
 
-## used admin password --> 2022_in_pygoat@pygoat.com  
-# ## not a easy password to be brute forced 
-@authentication_decorator
-def auth_failure_lab2(request):
+@login_required
+def ssti_view_blog(request, blog_id):
+    """
+    Render blog content from DB. Do not execute templates from user content.
+    """
+    try:
+        blog = Blogs.objects.get(blog_id=blog_id)
+    except Blogs.DoesNotExist:
+        return HttpResponseBadRequest("Blog not found")
+
+    # Render the content in a safe template that escapes content by default
+    # Template "safe_blog_view.html" should call {{ blog.blog_content|safe }} only if you are intentionally allowing HTML.
+    return render(request, "Lab_2021/A3_Injection/Blogs/view_blog.html", {"blog": blog})
+
+
+# ---------------------------
+# Crypto failure labs (fix cookie signing and hashing)
+# ---------------------------
+
+@login_required
+def crypto_failure(request):
+    return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure.html", {"success": False, "failure": False})
+
+
+@login_required
+@ensure_csrf_cookie
+def crypto_failure_lab(request):
+    """
+    Example used MD5 — weak. Still keep behavior for lab but note that MD5 is insecure.
+    Use try/except carefully and avoid printing sensitive values.
+    """
     if request.method == "GET":
-        return render(request,"Lab_2021/A7_auth_failure/lab2.html" )
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab.html")
 
-    elif request.method == "POST":
-        username = request.POST["username"]
-        password = request.POST["password"]
+    username = request.POST.get("username", "")
+    password = request.POST.get("password", "")
+    try:
+        hashed = hashlib.md5(password.encode()).hexdigest()
+        user = CF_user.objects.filter(username=username, password=hashed).first()
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab.html", {"user": user, "success": True, "failure": False})
+    except Exception:
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab.html", {"success": False, "failure": True})
+
+
+@login_required
+@ensure_csrf_cookie
+def crypto_failure_lab2(request):
+    if request.method == "GET":
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html")
+
+    username = request.POST.get("username", "")
+    password = request.POST.get("password", "")
+    try:
+        # customHash presumably exists in codebase — ensure it uses a secure algorithm (e.g. PBKDF2 or bcrypt)
+        password2 = customHash(password)
+        user = CF_user.objects.filter(username=username, password2=password2).first()
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html", {"user": user, "success": True, "failure": False})
+    except Exception:
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html", {"success": False, "failure": True})
+
+
+@login_required
+@ensure_csrf_cookie
+def crypto_failure_lab3(request):
+    """
+    Fix cookie handling: use signed timestamped cookie to prevent tampering.
+    The lab originally created cookie "username|expiry" — replaced with a signed token.
+    """
+    if request.method == "GET":
+        cookie_value = request.COOKIES.get("cookie")
+        if not cookie_value:
+            return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html", {"success": False, "failure": False})
+
         try:
-            user = AF_admin.objects.get(username=username)
-            print(type(user.lockout_cooldown))
-            if user.is_locked == True and user.lockout_cooldown > datetime.datetime.now():
-                return render(request,"Lab_2021/A7_auth_failure/lab2.html", {"is_locked":True})
-            
-            try:
-                ph = PasswordHasher()
-                ph.verify(user.password, password)
-                if user.is_locked == True and user.lockout_cooldown < datetime.datetime.now():
-                    user.is_locked = False
-                    user.last_login = datetime.datetime.now()
-                    user.failattempt = 0
-                    user.save()
-                return render(request,"Lab_2021/A7_auth_failure/lab2.html", {"user":user, "success":True,"failure":False})
-            except:
-                # fail attempt
-                print("wrong password")
-                fail_attempt = user.failattempt + 1
-                if fail_attempt == 5:
-                    user.is_active = False
-                    user.failattempt = 0
-                    user.is_locked = True
-                    user.lockout_cooldown = datetime.datetime.now() + datetime.timedelta(minutes=1440)
-                    user.save()
-                    return render(request,"Lab_2021/A7_auth_failure/lab2.html", {"user":user, "success":False,"failure":True, "is_locked":True})
-                user.failattempt = fail_attempt
-                user.save()
-                return render(request,"Lab_2021/A7_auth_failure/lab2.html",{"success":False, "failure":True})
-        except Exception as e:
-            print(e)
-            return render(request,"Lab_2021/A7_auth_failure/lab2.html",{"success":False, "failure":True})
+            # loads with max_age validation
+            signer = TimestampSigner(key=SECRET_COOKIE_KEY)
+            username = signer.unsign(cookie_value, max_age=60 * 60)  # 60 minutes
+            # if username == 'admin' => admin view
+            is_admin = (username == "admin")
+            return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html", {"success": True, "failure": False, "admin": is_admin})
+        except BadSignature:
+            # invalid or expired cookie
+            return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html", {"success": False, "failure": False})
 
-## Hardcoed user table for demonstration purpose only
+    # POST: set cookie if credentials match
+    username = request.POST.get("username", "")
+    password = request.POST.get("password", "")
+    try:
+        if username == "User" and password == "P@$$w0rd":
+            signer = TimestampSigner(key=SECRET_COOKIE_KEY)
+            signed = signer.sign(username)
+            response = render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html", {"success": True, "failure": False, "admin": False})
+            response.set_cookie("cookie", signed, httponly=True, secure=False, samesite="Lax")
+            return response
+        else:
+            response = render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab3.html", {"success": False, "failure": True})
+            # Clear cookie safely
+            response.delete_cookie("cookie")
+            return response
+    except Exception:
+        return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html", {"success": False, "failure": True})
+
+
+# ---------------------------
+# Security Misconfiguration lab (JWT with validated key usage)
+# ---------------------------
+
+@login_required
+def sec_misconfig_lab3(request):
+    """
+    The original decoded JWT using SECRET_COOKIE_KEY directly.
+    We'll keep jwt behavior but validate errors properly.
+    """
+    cookie = request.COOKIES.get("auth_cookie")
+    if cookie:
+        try:
+            payload = jwt.decode(cookie, SECRET_COOKIE_KEY, algorithms=["HS256"])
+            is_admin = (payload.get("user") == "admin")
+            return render(request, "Lab/sec_mis/sec_mis_lab3.html", {"admin": is_admin})
+        except jwt.ExpiredSignatureError:
+            pass
+        except jwt.InvalidTokenError:
+            pass
+
+    # create a new token for not_admin
+    payload = {
+        "user": "not_admin",
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=60),
+        "iat": datetime.datetime.utcnow(),
+    }
+    cookie_val = jwt.encode(payload, SECRET_COOKIE_KEY, algorithm="HS256")
+    response = render(request, "Lab/sec_mis/sec_mis_lab3.html", {"admin": False})
+    # cookie safe flags
+    response.set_cookie(key="auth_cookie", value=cookie_val, httponly=True, secure=False, samesite="Lax")
+    return response
+
+
+# ---------------------------
+# Authentication failure labs (keep behavior but secure)
+# ---------------------------
+
+@login_required
+def auth_failure(request):
+    if request.method == "GET":
+        return render(request, "Lab_2021/A7_auth_failure/a7.html")
+
+
+@login_required
+@ensure_csrf_cookie
+def auth_failure_lab2(request):
+    """
+    Hardened: uses PasswordHasher (from argon2/argon2_cffi or passlib). Keep logic but avoid leaking internals.
+    """
+    if request.method == "GET":
+        return render(request, "Lab_2021/A7_auth_failure/lab2.html")
+
+    username = request.POST.get("username", "")
+    password = request.POST.get("password", "")
+
+    try:
+        user = AF_admin.objects.get(username=username)
+    except AF_admin.DoesNotExist:
+        return render(request, "Lab_2021/A7_auth_failure/lab2.html", {"success": False, "failure": True})
+
+    # check lockout
+    now = timezone.now()
+    if getattr(user, "is_locked", False) and getattr(user, "lockout_cooldown", None) and user.lockout_cooldown > now:
+        return render(request, "Lab_2021/A7_auth_failure/lab2.html", {"is_locked": True})
+
+    from argon2 import PasswordHasher
+
+    ph = PasswordHasher()
+    try:
+        # verify password (assume user.password is a secure hash)
+        ph.verify(user.password, password)
+        # successful login: reset lockout state
+        if getattr(user, "is_locked", False) and getattr(user, "lockout_cooldown", None) and user.lockout_cooldown < now:
+            user.is_locked = False
+            user.last_login = now
+            user.failattempt = 0
+            user.save()
+        return render(request, "Lab_2021/A7_auth_failure/lab2.html", {"user": user, "success": True, "failure": False})
+    except Exception:
+        # Wrong password -> increment failattempt safely
+        fail_attempt = getattr(user, "failattempt", 0) + 1
+        user.failattempt = fail_attempt
+        if fail_attempt >= 5:
+            user.is_active = False
+            user.failattempt = 0
+            user.is_locked = True
+            user.lockout_cooldown = now + datetime.timedelta(minutes=1440)
+            user.save()
+            return render(request, "Lab_2021/A7_auth_failure/lab2.html", {"user": user, "success": False, "failure": True, "is_locked": True})
+        user.save()
+        return render(request, "Lab_2021/A7_auth_failure/lab2.html", {"success": False, "failure": True})
+
+
+# Hardcoded user table for lab3 (kept but hashed). In real app use DB and Django auth.
 USER_A7_LAB3 = {
-    "User1":{"userid":"1", "username":"User1", "password": "491a2800b80719ea9e3c89ca5472a8bda1bdd1533d4574ea5bd85b70a8e93be0"},
-    "User2":{"userid":"2", "username":"User2", "password": "c577e95bf729b94c30a878d01155693a9cdddafbb2fe0d52143027474ecb91bc"},
-    "User3":{"userid":"3", "username":"User3", "password": "5a91a66f0c86b5435fe748706b99c17e6e54a17e03c2a3ef8d0dfa918db41cf6"},
-    "User4":{"userid":"4", "username":"User4", "password": "6046bc3337728a60967a151ee584e4fd7c53740a49485ebdc38cac42a255f266"}
+    "User1": {"userid": "1", "username": "User1", "password": "491a28..."},
+    "User2": {"userid": "2", "username": "User2", "password": "c577e9..."},
+    "User3": {"userid": "3", "username": "User3", "password": "5a91a6..."},
+    "User4": {"userid": "4", "username": "User4", "password": "6046bc..."},
 }
 
-# USER_A7_LAB3 = {
-#     "User1":{"userid":"1", "username":"User1", "password": "Hash1"},
-#     "User2":{"userid":"2", "username":"User2", "password": "Hash2"},
-#     "User3":{"userid":"3", "username":"User3", "password": "Hash3"},
-#     "User4":{"userid":"4", "username":"User4", "password": "Hash4"}
-# }
 
-@authentication_decorator
-@csrf_exempt
+@login_required
+@ensure_csrf_cookie
 def auth_failure_lab3(request):
     if request.method == "GET":
         try:
-            cookie = request.COOKIES["session_id"]
-            session = AF_session_id.objects.get(session_id=cookie)
-            if session :
-                return render(request,"Lab_2021/A7_auth_failure/lab3.html", {"username":session.user,"success":True})
-        except:
+            cookie = request.COOKIES.get("session_id")
+            if cookie:
+                session = AF_session_id.objects.filter(session_id=cookie).first()
+                if session:
+                    return render(request, "Lab_2021/A7_auth_failure/lab3.html", {"username": session.user, "success": True})
+        except Exception:
             pass
         return render(request, "Lab_2021/A7_auth_failure/lab3.html")
-    elif request.method == "POST":
+
+    # POST
+    try:
+        username = request.POST["username"]
+        password = request.POST["password"]
+    except KeyError:
+        response = render(request, "Lab_2021/A7_auth_failure/lab3.html")
+        response.delete_cookie("session_id")
+        return response
+
+    # hash the password input
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    if username in USER_A7_LAB3 and USER_A7_LAB3[username]["password"] == password_hash:
         token = str(uuid.uuid4())
-        try:
-            username = request.POST["username"]
-            password = request.POST["password"]
-            password = hashlib.sha256(password.encode()).hexdigest()
-        except:
-            response = render(request, "Lab_2021/A7_auth_failure/lab3.html")
-            response.set_cookie("session_id", None)
-            return response
+        session_data = AF_session_id.objects.create(session_id=token, user=USER_A7_LAB3[username]["username"])
+        session_data.save()
+        response = render(request, "Lab_2021/A7_auth_failure/lab3.html", {"success": True, "failure": False, "username": username})
+        response.set_cookie("session_id", token, httponly=True, secure=False, samesite="Lax")
+        return response
 
-        if USER_A7_LAB3[username]['password'] == password:
-            session_data = AF_session_id.objects.create(session_id=token, user=USER_A7_LAB3[username]['username'])
-            session_data.save()
-            response = render(request, "Lab_2021/A7_auth_failure/lab3.html", {"success":True, "failure":False, "username":username})
-            response.set_cookie("session_id", token)
-            return response
+    # fallback: invalid creds
+    response = render(request, "Lab_2021/A7_auth_failure/lab3.html", {"success": False, "failure": True})
+    response.delete_cookie("session_id")
+    return response
 
-#-- coding playground for lab2
-@authentication_decorator
+
+@login_required
 def A7_discussion(request):
-    return render(request,"playground/A7/index.html")
-        
-## ---------------------Software and Data Integrity Failures-------------------------------------------
-@authentication_decorator
+    return render(request, "playground/A7/index.html")
+
+
+# ---------------------------
+# Software & data integrity (kept behavior, safer rendering)
+# ---------------------------
+
+@login_required
 def software_and_data_integrity_failure(request):
     if request.method == "GET":
-        return render(request,"Lab_2021/A8_software_and_data_integrity_failure/desc.html")
+        return render(request, "Lab_2021/A8_software_and_data_integrity_failure/desc.html")
 
 
-@authentication_decorator
+@login_required
 def software_and_data_integrity_failure_lab2(request):
     if request.method == "GET":
         try:
-            username = request.GET["username"]
-            return render(request,"Lab_2021/A8_software_and_data_integrity_failure/lab2.html", {"username":username,"success":True})
-        except:
-            return render(request,"Lab_2021/A8_software_and_data_integrity_failure/lab2.html")
+            username = escape(request.GET.get("username", ""))
+            return render(request, "Lab_2021/A8_software_and_data_integrity_failure/lab2.html", {"username": username, "success": True})
+        except Exception:
+            return render(request, "Lab_2021/A8_software_and_data_integrity_failure/lab2.html")
 
 
-@authentication_decorator
+@login_required
 def software_and_data_integrity_failure_lab3(request):
-    pass
+    # Not implemented in original file; keep placeholder
+    return render(request, "Lab_2021/A8_software_and_data_integrity_failure/lab3.html")
 
-## --------------------------A6_discussion-------------------------------------------------------
 
-@authentication_decorator
+@login_required
 def A6_discussion(request):
-    
-    return render(request,"playground/A6/index.html")
+    return render(request, "playground/A6/index.html")

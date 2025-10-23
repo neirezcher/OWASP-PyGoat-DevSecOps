@@ -38,7 +38,7 @@
                 .then(result => {
                     var data = JSON.parse(result);
                     ports = data.ports;
-                    for (p in data.ports){
+                    for (let p in data.ports){
                         output.innerHTML += "<span>" + ports[p] + "</span><br>";}
                 })
                 .catch(

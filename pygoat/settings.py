@@ -22,12 +22,12 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # See https://docs.djangoproject.com/en/3.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'lr66%-a!$km5ed@n5ug!tya5bv!0(yqwa1tn!q%0%3m2nh%oml'
 
-SENSITIVE_DATA = 'FLAGTHATNEEDSTOBEFOUND'
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "fallback-secret-key")
+SENSITIVE_DATA = os.environ.get("SENSITIVE_DATA", "default-flag")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() in ("true", "1")
 
 ALLOWED_HOSTS = ['pygoat.herokuapp.com', '0.0.0.0.']
 
@@ -61,6 +61,8 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'allauth.account.middleware.AccountMiddleware',
+
 ]
 
 ROOT_URLCONF = 'pygoat.urls'
@@ -81,7 +83,7 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'pygoat.wsgi.application'
+WSGI_APPLICATION = os.environ.get("WSGI_APPLICATION")
 
 
 # Database
@@ -167,6 +169,6 @@ SOCIALACCOUNT_PROVIDERS = {
         }
     }
 }
+SECRET_COOKIE_KEY = os.environ.get("SECRET_COOKIE_KEY", "default_cookie_secret")
 
-SECRET_COOKIE_KEY = "PYGOAT"
 CSRF_TRUSTED_ORIGINS = ["http://127.0.0.1:8000","http://0.0.0.0:8000","http://172.16.189.10"]
