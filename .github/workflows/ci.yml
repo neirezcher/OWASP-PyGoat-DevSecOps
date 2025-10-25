@@ -131,7 +131,7 @@ jobs:
           docker run --rm -t --network zapnet \
             -v $PWD/zap_reports:/zap/wrk \
             zaproxy/zap-stable:latest zap-baseline.py \
-            -t http://host.docker.internal:8000 \
+            -t http://pygoat_test:8000 \
             -r /zap/wrk/zap_report.html \
             -J /zap/wrk/zap_report.json
 
