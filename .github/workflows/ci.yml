@@ -117,16 +117,15 @@ jobs:
       - name: Run Django Container
         run: |
           docker run --env-file .env -d --name pygoat_test -p 8000:8000 pygoat:latest
-          sleep 15  # give Django time to start
+          sleep 20  # give Django time to start
           docker exec pygoat_test python manage.py migrate
-
-      - name: Install OWASP ZAP CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zaproxy
-
+      
       - name: Run DAST Scan with OWASP ZAP
         run: |
-          zap-cli --zap-url http://localhost -p 8080 quick-scan --self-contained http://localhost:8000
-          # Fail if critical vulnerabilities found
-          zap-cli --zap-url http://localhost -p 8080 alerts -l High
+          docker run --rm -t \
+            --network host \
+            owasp/zap2docker-stable zap-baseline.py \
+            -t http://host.docker.internal:8000 \
+            -r zap_report.html \
+            -J zap_report.json
+
