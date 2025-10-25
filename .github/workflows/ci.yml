@@ -125,7 +125,7 @@ jobs:
           docker pull zaproxy/zap-stable:latest
           docker run --rm -t \
             --network host \
-            owasp/zap2docker-stable:2.12.0 zap-baseline.py \
+            zaproxy/zap-stable:latest zap-baseline.py \
             -t http://host.docker.internal:8000 \
             -r zap_report.html \
             -J zap_report.json
