@@ -122,7 +122,7 @@ jobs:
       
       - name: Run DAST Scan with OWASP ZAP
         run: |
-          docker pull owasp/zap2docker-stable:2.12.0
+          docker pull zaproxy/zap-stable:latest
           docker run --rm -t \
             --network host \
             owasp/zap2docker-stable:2.12.0 zap-baseline.py \
