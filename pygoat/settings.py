@@ -40,6 +40,7 @@ ALLOWED_HOSTS = [
     'localhost',
     'pygoat_test',
     'host.docker.internal',
+    '*'
 ]
 
 # Application definition
