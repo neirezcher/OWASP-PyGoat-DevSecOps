@@ -33,7 +33,8 @@ if not DEBUG:
     django_heroku.settings(locals())
 
 
-ALLOWED_HOSTS = ['pygoat.herokuapp.com', '0.0.0.0.']
+ALLOWED_HOSTS = ['pygoat.herokuapp.com', '0.0.0.0.','127.0.0.1', 'pygoat_test']
+
 
 
 # Application definition
