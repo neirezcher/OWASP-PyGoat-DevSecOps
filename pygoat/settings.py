@@ -33,9 +33,14 @@ if not DEBUG:
     django_heroku.settings(locals())
 
 
-ALLOWED_HOSTS = ['pygoat.herokuapp.com', '0.0.0.0.','127.0.0.1', 'pygoat_test']
-
-
+ALLOWED_HOSTS = [
+    'pygoat.herokuapp.com',
+    '0.0.0.0',
+    '127.0.0.1',
+    'localhost',
+    'pygoat_test',
+    'host.docker.internal',
+]
 
 # Application definition
 
@@ -173,4 +178,12 @@ SOCIALACCOUNT_PROVIDERS = {
 }
 SECRET_COOKIE_KEY = os.environ.get("SECRET_COOKIE_KEY", "default_cookie_secret")
 
-CSRF_TRUSTED_ORIGINS = ["http://127.0.0.1:8000","http://0.0.0.0:8000","http://172.16.189.10"]
+CSRF_TRUSTED_ORIGINS = [
+    "http://172.16.189.10",
+    "http://127.0.0.1:8000",
+    "http://0.0.0.0:8000",
+    "http://localhost:8000",
+    "http://pygoat_test:8000",
+    "http://host.docker.internal:8000",
+]
+
