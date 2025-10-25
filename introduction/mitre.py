@@ -9,12 +9,14 @@ from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import redirect, render
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
+from django.contrib.auth.hashers import check_password, make_password
 
-from .models import CSRF_user_tbl
+from .models import CSRFUserTbl
+import logging
 
 # Mitre top1 | CWE:787
 FLAG = "NOT_SUPPOSED_TO_BE_ACCESSED"
-
+logger = logging.getLogger(__name__)
 
 # ============ MITRE Pages ============ #
 
@@ -151,17 +153,44 @@ def csrf_lab_login(request):
     if request.method == 'GET':
         return render(request, 'mitre/csrf_lab_login.html')
 
-    elif request.method == 'POST':
-        username = request.POST.get('username')
-        password = request.POST.get('password')
+    # POST
+    username = (request.POST.get('username') or "").strip()
+    password = (request.POST.get('password') or "").strip()
 
-        if not username or not password:
+    if not username or not password:
+        return redirect('/mitre/9/lab/login')
+
+    try:
+        user = CSRFUserTbl.objects.filter(username=username).first()
+        if not user:
+            # generic redirect for invalid credentials
             return redirect('/mitre/9/lab/login')
 
-        hashed_pwd = md5(password.encode()).hexdigest()
-        user = CSRF_user_tbl.objects.filter(username=username, password=hashed_pwd).first()
+        stored = (user.password or "").strip()
 
-        if user:
+        # 1 Preferred: stored value is a Django hashed password (pbkdf2 prefix)
+        if stored.startswith("pbkdf2_") or stored.startswith("argon2$") or stored.startswith("bcrypt$"):
+            if check_password(password, stored):
+                authenticated = True
+            else:
+                authenticated = False
+        else:
+            # 2 Legacy support: if the stored value looks like an MD5 hex (32 hex chars),
+            # validate MD5 and, on success, re-hash into Django's default hasher.
+            if len(stored) == 32 and all(c in "0123456789abcdef" for c in stored.lower()):
+                md5_hex = md5(password.encode()).hexdigest()
+                if md5_hex == stored:
+                    # successful legacy auth: re-hash password into pbkdf2
+                    user.password = make_password(password)
+                    user.save(update_fields=["password"])
+                    authenticated = True
+                else:
+                    authenticated = False
+            else:
+                # unknown format: attempt check_password anyway (safe)
+                authenticated = check_password(password, stored)
+
+        if authenticated:
             payload = {
                 'username': username,
                 'exp': datetime.datetime.utcnow() + datetime.timedelta(seconds=300),
@@ -171,8 +200,23 @@ def csrf_lab_login(request):
             token = jwt.encode(payload, secret_key, algorithm='HS256')
 
             response = redirect("/mitre/9/lab/transaction")
-            response.set_cookie('auth_cookiee', token, httponly=True, secure=True, samesite='Strict')
+            # Set cookie — httponly + secure + samesite recommended (tests expect auth_cookiee)
+            response.set_cookie(
+                'auth_cookiee',
+                token,
+                httponly=True,
+                secure=getattr(settings, "SESSION_COOKIE_SECURE", False),
+                samesite='Strict',
+                max_age=300
+            )
             return response
+
+        # fallback: invalid credentials (generic)
+        return redirect('/mitre/9/lab/login')
+
+    except Exception:
+        logger.exception("Error during csrf_lab_login for username=%s", username)
+        # avoid leaking internals
         return redirect('/mitre/9/lab/login')
 
 
@@ -185,7 +229,7 @@ def csrf_transfer_monei(request):
             secret_key = getattr(settings, "JWT_SECRET_KEY", "csrf_vulnerability_key")
             payload = jwt.decode(cookie, secret_key, algorithms=['HS256'])
             username = payload['username']
-            user = CSRF_user_tbl.objects.filter(username=username).first()
+            user = CSRFUserTbl.objects.filter(username=username).first()
             if not user:
                 return redirect('/mitre/9/lab/login')
             return render(request, 'mitre/csrf_dashboard.html', {'balance': user.balance})
@@ -206,8 +250,8 @@ def csrf_transfer_monei_api(request, recipent, amount):
             payload = jwt.decode(cookie, secret_key, algorithms=['HS256'])
             username = payload['username']
 
-            sender = CSRF_user_tbl.objects.filter(username=username).first()
-            recipient = CSRF_user_tbl.objects.filter(username=recipent).first()
+            sender = CSRFUserTbl.objects.filter(username=username).first()
+            recipient = CSRFUserTbl.objects.filter(username=recipent).first()
 
             if not sender or not recipient:
                 return redirect('/mitre/9/lab/login')

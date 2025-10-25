@@ -38,20 +38,21 @@ from PIL import Image
 # Import app models and utilities (adapt names if necessary)
 from .forms import NewUserForm
 from .models import (
-    AF_admin,
-    AF_session_id,
+    AFAdmin,
+    AFSessionID,
     Blogs,
-    CF_user,
+    CFUser,
     FAANG,
-    authLogin,
-    comments,
-    info,
-    login as LoginModel,
-    otp,
-    sql_lab_table,
-    tickits,
+    AuthLogin,
+    Comments,
+    Info,
+    Login as LoginModel,
+    OTP,
+    SQLLabTable,
+    Tickits,
 )
 from .utility import customHash, filter_blog
+
 
 # Logging: avoid logging sensitive info like passwords
 logging.basicConfig(level=logging.INFO, filename="app.log")
@@ -271,8 +272,8 @@ def xxe_lab(request):
 @login_required
 @csrf_protect
 def xxe_see(request):
-    # Safely display comments; avoid injecting XML directly
-    data = comments.objects.all()
+    # Safely display Comments; avoid injecting XML directly
+    data = Comments.objects.all()
     com = data[0].comment if data else ""
     return render(request, "Lab/XXE/xxe_lab.html", {"com": escape(com)})
 
@@ -294,7 +295,7 @@ def xxe_parse(request):
             startInd = text.find(">")
             endInd = text.find("<", startInd)
             text_val = text[startInd + 1:endInd]
-            comments.objects.filter(id=1).update(comment=text_val)
+            Comments.objects.filter(id=1).update(comment=text_val)
     except Exception:
         # Do not reveal details to user
         pass
@@ -515,11 +516,11 @@ def Otp(request):
             return render(request, "Lab/BrokenAuth/otp.html")
         otpN = secrets.randbelow(900) + 100
         if email == "admin@pygoat.com":
-            otp.objects.filter(id=2).update(otp=otpN)
+            OTP.objects.filter(id=2).update(otp=otpN)
             response = render(request, "Lab/BrokenAuth/otp.html", {"otp": "Sent To Admin Mail ID"})
             response.set_cookie('email', email, samesite='Lax', secure=settings.SECURE_COOKIE, httponly=True)
             return response
-        otp.objects.filter(id=1).update(email=email, otp=otpN)
+        OTP.objects.filter(id=1).update(email=email, otp=otpN)
         response = render(request, "Lab/BrokenAuth/otp.html", {"otp": otpN})
         response.set_cookie('email', email, samesite='Lax', secure=settings.SECURE_COOKIE, httponly=True)
         return response
@@ -527,7 +528,7 @@ def Otp(request):
     # POST: verify
     otpR = request.POST.get("otp")
     email = request.COOKIES.get("email")
-    if otp.objects.filter(email=email, otp=otpR) or otp.objects.filter(id=2, otp=otpR):
+    if OTP.objects.filter(email=email, otp=otpR) or OTP.objects.filter(id=2, otp=otpR):
         return render(request, "Lab/BrokenAuth/otp.html", {"email": email})
     return render(request, "Lab/BrokenAuth/otp.html", {"otp": "Invalid OTP Please Try Again"})
 
@@ -759,7 +760,7 @@ def insec_desgine_lab(request):
     - Proper error messages and input validation.
     """
     # fetch existing tickets for current user
-    tkts_qs = tickits.objects.filter(user=request.user)
+    tkts_qs = Tickits.objects.filter(user=request.user)
     Tickets = [t.tickit for t in tkts_qs]
 
     if request.method == "GET":
@@ -977,27 +978,57 @@ def injection_sql_lab(request):
     password = request.POST.get("pass", "")
 
     # seed data if table is empty (do this once)
-    if not sql_lab_table.objects.exists():
-        sql_lab_table.objects.create(id="admin", password="65079b006e85a7e798abecb99e47c154")
-        sql_lab_table.objects.create(id="jack", password="jack")
-        sql_lab_table.objects.create(id="slinky", password="b4f945433ea4c369c12741f62a23ccc0")
-        sql_lab_table.objects.create(id="bloke", password="f8d1ce191319ea8f4d1d26e65e130dd5")
+    if not SQLLabTable.objects.exists():
+        users = [
+            {
+                "id": os.getenv("SQL_ADMIN_ID", "admin"),
+                "password": os.getenv("SQL_ADMIN_PASSWORD", "change_me_admin"),
+            },
+            {
+                "id": os.getenv("SQL_JACK_ID", "jack"),
+                "password": os.getenv("SQL_JACK_PASSWORD", "change_me_jack"),
+            },
+            {
+                "id": os.getenv("SQL_SLINKY_ID", "slinky"),
+                "password": os.getenv("SQL_SLINKY_PASSWORD", "change_me_slinky"),
+            },
+            {
+                "id": os.getenv("SQL_BLOKE_ID", "bloke"),
+                "password": os.getenv("SQL_BLOKE_PASSWORD", "change_me_bloke"),
+            },
+        ]
+
+        for user in users:
+            instance = SQLLabTable(id=user["id"], password=user["password"])
+            instance.save()
 
     if not name:
         return render(request, "Lab_2021/A3_Injection/sql_lab.html")
 
     # Use ORM to search; prevents injection
     try:
-        user_qs = sql_lab_table.objects.filter(id=name, password=password)
-        if user_qs.exists():
-            found_id = user_qs.first().id
-            return render(request, "Lab_2021/A3_Injection/sql_lab.html", {"user1": found_id})
+        user = SQLLabTable.objects.filter(id=name).first()
+        if user and user.check_password(password):
+            return render(
+                    request,
+                    "Lab_2021/A3_Injection/sql_lab.html",
+                    {"user1": user.id}
+                )
         else:
             sql_error = "No matching user found (input sanitized)"
-            return render(request, "Lab_2021/A3_Injection/sql_lab.html", {"wrongpass": password, "sql_error": sql_error})
-    except Exception as exc:
-        # do not leak exceptions to users
-        return render(request, "Lab_2021/A3_Injection/sql_lab.html", {"sql_error": "Internal error"})
+            return render(
+                    request,
+                    "Lab_2021/A3_Injection/sql_lab.html",
+                    {"sql_error": sql_error}
+                )
+
+    except Exception:
+        return render(
+                request,
+                "Lab_2021/A3_Injection/sql_lab.html",
+                {"sql_error": "Internal error"}
+            )
+
 
 
 # ---------------------------
@@ -1187,7 +1218,7 @@ def crypto_failure_lab(request):
     password = request.POST.get("password", "")
     try:
         hashed = hashlib.md5(password.encode()).hexdigest()
-        user = CF_user.objects.filter(username=username, password=hashed).first()
+        user = CFUser.objects.filter(username=username, password=hashed).first()
         return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab.html", {"user": user, "success": True, "failure": False})
     except Exception:
         return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab.html", {"success": False, "failure": True})
@@ -1204,7 +1235,7 @@ def crypto_failure_lab2(request):
     try:
         # customHash presumably exists in codebase — ensure it uses a secure algorithm (e.g. PBKDF2 or bcrypt)
         password2 = customHash(password)
-        user = CF_user.objects.filter(username=username, password2=password2).first()
+        user = CFUser.objects.filter(username=username, password2=password2).first()
         return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html", {"user": user, "success": True, "failure": False})
     except Exception:
         return render(request, "Lab_2021/A2_Crypto_failur/crypto_failure_lab2.html", {"success": False, "failure": True})
@@ -1309,8 +1340,8 @@ def auth_failure_lab2(request):
     password = request.POST.get("password", "")
 
     try:
-        user = AF_admin.objects.get(username=username)
-    except AF_admin.DoesNotExist:
+        user = AFAdmin.objects.get(username=username)
+    except AFAdmin.DoesNotExist:
         return render(request, "Lab_2021/A7_auth_failure/lab2.html", {"success": False, "failure": True})
 
     # check lockout
@@ -1362,7 +1393,7 @@ def auth_failure_lab3(request):
         try:
             cookie = request.COOKIES.get("session_id")
             if cookie:
-                session = AF_session_id.objects.filter(session_id=cookie).first()
+                session = AFSessionID.objects.filter(session_id=cookie).first()
                 if session:
                     return render(request, "Lab_2021/A7_auth_failure/lab3.html", {"username": session.user, "success": True})
         except Exception:
@@ -1382,7 +1413,7 @@ def auth_failure_lab3(request):
     password_hash = hashlib.sha256(password.encode()).hexdigest()
     if username in USER_A7_LAB3 and USER_A7_LAB3[username]["password"] == password_hash:
         token = str(uuid.uuid4())
-        session_data = AF_session_id.objects.create(session_id=token, user=USER_A7_LAB3[username]["username"])
+        session_data = AFSessionID.objects.create(session_id=token, user=USER_A7_LAB3[username]["username"])
         session_data.save()
         response = render(request, "Lab_2021/A7_auth_failure/lab3.html", {"success": True, "failure": False, "username": username})
         response.set_cookie("session_id", token, httponly=True, secure=False, samesite="Lax")
