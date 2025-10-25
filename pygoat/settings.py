@@ -29,6 +29,10 @@ SENSITIVE_DATA = os.environ.get("SENSITIVE_DATA", "default-flag")
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() in ("true", "1")
 
+if not DEBUG:
+    django_heroku.settings(locals())
+
+
 ALLOWED_HOSTS = ['pygoat.herokuapp.com', '0.0.0.0.']
 
 
@@ -144,9 +148,6 @@ CRISPY_TEMPLATE_PACK = 'bootstrap4'
 LOGIN_REDIRECT_URL='/'
 LOGOUT_REDIRECT_URL = '/'
 
-
-# Activate Django-Heroku.
-django_heroku.settings(locals())
 
 #Authentication Backend
 
