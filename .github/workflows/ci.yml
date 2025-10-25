@@ -114,9 +114,12 @@ jobs:
       - name: Build Docker Image
         run: docker build -t pygoat:latest .
 
+      - name: Setup Docker Network
+        run: docker network create zapnet || true
+      
       - name: Run Django Container
         run: |
-          docker run --env-file .env -d --name pygoat_test -p 8000:8000 pygoat:latest
+          docker run --env-file .env -d --name pygoat_test --network zapnet -p 8000:8000 pygoat:latest
           sleep 20  # give Django time to start
           docker exec pygoat_test python manage.py migrate
       
@@ -124,10 +127,11 @@ jobs:
         run: |
           docker pull zaproxy/zap-stable:latest
           mkdir -p zap_reports
-          docker run --rm -t \
+          chmod 777 zap_reports
+          docker run --rm -t --network zapnet \
             -v $PWD/zap_reports:/zap/wrk \
             zaproxy/zap-stable:latest zap-baseline.py \
-            -t http://host.docker.internal:8000 \
+            -t http://pygoat_test:8000 \
             -r /zap/wrk/zap_report.html \
             -J /zap/wrk/zap_report.json
 
