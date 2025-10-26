@@ -139,4 +139,4 @@ jobs:
                 -config replacer.full_list\(0\).matchType=REQ_HEADER \
                 -config replacer.full_list\(0\).matchString=Host \
                 -config replacer.full_list\(0\).regex=false \
-                -config replacer.full_list\(0\).replacement=pygoat_test"
+                -config replacer.full_list\(0\).replacement=127.0.0.1"
