@@ -132,7 +132,7 @@ jobs:
             -v $PWD/zap_reports:/zap/wrk \
             zaproxy/zap-stable:latest zap-baseline.py \
             -t http://pygoat_test:8000 \
+            -H 'Host: pygoat_test' \ 
             -r zap_report.html \
             -J zap_report.json
-
 
